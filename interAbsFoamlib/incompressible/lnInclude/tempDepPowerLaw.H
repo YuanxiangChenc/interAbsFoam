@@ -1,1 +1,0 @@
-../viscosityModels/tempdeppowerLaw/tempDepPowerLaw.H

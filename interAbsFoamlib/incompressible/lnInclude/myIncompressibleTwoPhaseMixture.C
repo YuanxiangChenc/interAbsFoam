@@ -1,1 +1,0 @@
-../myIncompressibleTwoPhaseMixture/myIncompressibleTwoPhaseMixture.C
