@@ -172,7 +172,20 @@ int main(int argc, char *argv[])
             }
 	    
 	    #include "updateCSat_T.H"
-	    #include "cEqn.H"    
+
+	    ///////// solve c — runtime model selection ////////
+	    // blocked       = face-based  (cEqn.H)
+	    // liquidCentred = cell-based  (cl_cEqn.H)
+	    if (absorptionModel == "blocked")
+	    {
+	        #include "cEqn.H"
+	    }
+	    else // "liquidCentred"
+	    {
+	        #include "cl_cEqn.H"
+	    }
+	    ////////////////////////////////////////////////////
+
 	    #include "TEqn.H"
             // #include "Output.H"
 

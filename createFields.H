@@ -448,6 +448,12 @@ mesh.setFluxRequired(alpha1.name());
 
 
 ///////////// absorption model selector ////////////////////
+// Only two production models are kept in interAbsFoam:
+//   blocked       = face-based blocked-laplacian + implicit source (cEqn.H)
+//   liquidCentred = cell-based Castro-style source + invadec       (cl_cEqn.H)
+//
+// bk_cEqn.H / rv_cEqn.H / pn_cEqn.H were exploratory variants with
+// worse performance and are not wired into this solver.
 word absorptionModel
 (
     transportProperties.lookupOrDefault<word>
@@ -458,23 +464,19 @@ word absorptionModel
 );
 
 Info<< "Absorption model: " << absorptionModel << nl
-    << "  blocked  = face-level blocked-laplacian  (cEqn.H)"       << nl
-    << "  bulk     = |grad(alpha)|^2 source         (bk_cEqn.H)"   << nl
-    << "  gradient = mixture gradient, m_abs in ceq (rv_cEqn.H)"   << nl
-    << "  penalty  = penalty + diagnostic m_abs     (pn_cEqn.H)"   << nl
+    << "  blocked       = face-based blocked-laplacian   (cEqn.H)"    << nl
+    << "  liquidCentred = cell-based Castro src + invadec (cl_cEqn.H)" << nl
     << endl;
 
 if
 (
     absorptionModel != "blocked"
- && absorptionModel != "bulk"
- && absorptionModel != "gradient"
- && absorptionModel != "penalty"
+ && absorptionModel != "liquidCentred"
 )
 {
     FatalErrorInFunction
         << "Unknown absorptionModel: " << absorptionModel
-        << "\nValid options: blocked  bulk  gradient  penalty"
+        << "\nValid options: blocked  liquidCentred"
         << exit(FatalError);
 }
 
@@ -490,6 +492,6 @@ autoPtr<OFstream> absFilePtr
     new OFstream(absDir/"absorptionAccum.dat")
 );
 
-// Header — 3 columns, consistent across all three cEqn variants
+// Header — consistent across both cEqn variants
 (*absFilePtr) << "# Time[s]  Mabs_acc[kg]  Mabs_acc_dz[kg/m]  GmAbsB[kg/s]  mean_c_liq[-]  mean_coeffB[1/s]  intGradAlpha[m2]" << nl;
 absFilePtr->flush();
