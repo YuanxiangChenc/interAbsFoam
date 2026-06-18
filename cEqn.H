@@ -237,7 +237,12 @@ volScalarField c_pre
 
 // ------------------------------------------------------------
 // 8. Concentration equation
-//    cSat enters as a volScalarField source term
+//
+//    fvm::div(phi, c): uses the full mixture flux.
+//    Switching to alphaPhi10 would require alpha-weighting ALL
+//    terms (ddt, laplacian) to remain consistent — that is a
+//    different equation (conservative VOF-scalar form).
+//    Gas-cell smearing is controlled by the hard reset below.
 // ------------------------------------------------------------
 fvScalarMatrix cEqnM
 (
@@ -246,7 +251,7 @@ fvScalarMatrix cEqnM
   - fvm::laplacian(D_masked, c)
   + fvm::Sp(coeffImpl, c)
  ==
-    coeffImpl * cSat     // volScalarField * volScalarField → OK
+    coeffImpl * cSat
 );
 
 fvOptions.constrain(cEqnM);
@@ -337,32 +342,39 @@ if (runTime.writeTime())
 // ------------------------------------------------------------
 // 11. Update sigma volScalarField using Marangoni law
 //
-//     c_eff blends c toward cSat near the interface to prevent
-//     spurious Marangoni spikes in diffusion-blocked cells.
-//     c_eff = alpha1*c + (1-alpha1)*cSat
-//           → equals c in bulk liquid, cSat in gas/near interface
+//     sigma = sigma0 + dsdT*(T - Tr) + dsdc*(cif - cr)
 //
-//     sigma = sigma0 + dsdT*(T - Tr) + dsdc*(c_eff - cr)
+//     cif = alpha1*c + (1-alpha1)*cSat  is the alpha-weighted
+//     interface concentration already updated this step.
+//     Using cif rather than a locally-built c_eff is cleaner:
+//     sigma is a mixture property evaluated at the interface
+//     concentration, not a phase-specific quantity.  In pure
+//     liquid (alpha=1) cif=c; at the interface cif blends toward
+//     cSat; in gas cif=cSat giving sigma=sigma0+dsdT*(T-Tr).
+//
+//     UNIT NOTE (transportProperties):
+//       dsdc  [N/m per unit mass fraction 0-1]
+//             Castro value -6.4e-4 is per wt% — enter -6.4e-2
+//       cr    must equal c0 = 0.5522 (NOT cSat0)
+//             so sigma = sigma0 at t=0 when T=Tr, c=c0
 // ------------------------------------------------------------
-{
-    volScalarField c_eff
-    (
-        IOobject
-        (
-            "c_eff",
-            mesh.time().timeName(),
-            mesh,
-            IOobject::NO_READ,
-            IOobject::NO_WRITE
-        ),
-        alpha1*c + (scalar(1) - alpha1)*cSat
-    );
 
-    sigma = sigma0 + dsdT*(T - Tr) + dsdc*(c_eff - cr);
+// Update cif with current c and cSat before sigma evaluation
+cif = alpha1*c + (scalar(1) - alpha1)*cSat;
 
-    // Bound: sigma must stay positive
-    sigma.max(dimensionedScalar("sigMin", sigma.dimensions(), 1e-4));
-}
+sigma = sigma0 + dsdT*(T - Tr) + dsdc*(cif - cr);
+
+sigma.max(dimensionedScalar("sigMin", sigma.dimensions(), 1e-4));
+
+Info<< "sigma range:  " << gMin(sigma.primitiveField())
+    << " – " << gMax(sigma.primitiveField())
+    << "  (sigma0 = " << sigma0.value() << " N/m)" << endl;
+
+sigma.max(dimensionedScalar("sigMin", sigma.dimensions(), 1e-4));
+
+Info<< "sigma range:  " << gMin(sigma.primitiveField())
+    << " – " << gMax(sigma.primitiveField())
+    << "  (sigma0 = " << sigma0.value() << " N/m)" << endl;
 
 // ------------------------------------------------------------
 // 12. Update rhoCp and rhoCpPhi after alpha / rho update

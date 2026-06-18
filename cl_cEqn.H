@@ -239,7 +239,32 @@ c.min(1.0);
 }
 
 // ------------------------------------------------------------
-// 6. Diagnostics
+// 6. Update sigma using cif  (mirrors cEqn.H step 11)
+//
+//    cif was updated at step 2 above:
+//      cif = alpha1*c + (1-alpha1)*cSat
+//    sigma = sigma0 + dsdT*(T - Tr) + dsdc*(cif - cr)
+//
+//    UNIT NOTE (transportProperties):
+//      dsdc [N/m per unit mass fraction 0-1]
+//           Castro -6.4e-4 is per wt% -> enter -6.4e-2
+//      cr   must equal c0 = 0.5522 (NOT cSat0)
+// ------------------------------------------------------------
+sigma = sigma0 + dsdT*(T - Tr) + dsdc*(cif - cr);
+sigma.max(dimensionedScalar("sigMin", sigma.dimensions(), 1e-4));
+
+Info<< "sigma range:  " << gMin(sigma.primitiveField())
+    << " – " << gMax(sigma.primitiveField())
+    << "  (sigma0 = " << sigma0.value() << " N/m)" << endl;
+
+// ------------------------------------------------------------
+// 7. Update rhoCp and rhoCpPhi
+// ------------------------------------------------------------
+rhoCp    = alpha1*rho1*cp1 + alpha2*rho2*cp2;
+rhoCpPhi = fvc::interpolate(rhoCp)*phi;
+
+// ------------------------------------------------------------
+// 8. Diagnostics
 // ------------------------------------------------------------
 const scalar domainVol = gSum(mesh.V().field());
 const scalar lx        = 0.076;

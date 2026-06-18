@@ -40,37 +40,89 @@ surfaceScalarField Fsvn
 );
 
 // ------------------------------------------------------------
-// 3. Tangential Marangoni forces  [N/m³]
+// 3. Tangential Marangoni force  [N/m³]
 //
-//    F_tang = (∇σ - n̂(n̂·∇σ)) |∇α|
+//    F_Marangoni = (I - n̂n̂) · ∇σ  *  |∇α|  *  nearInterface
 //
-//    ∇σ = dσ/dT * ∇T + dσ/dc * ∇(c_eff)
-//    The tangential projector (I - n̂n̂) isolates the in-plane
-//    component.  |∇α| localises the force at the interface.
+//    Two-layer localisation:
+//      |∇α|            — VOF delta function, ~2 cells wide
+//      nearInterface() — pos(α(1-α) - ε), sharper binary mask
+//    Product confines the force to the 1-2 cell interface band.
+//    Without nearInterface(), fvc::grad(sigma_liq) carries the
+//    gradient 3-4 cells into the liquid via its stencil width,
+//    and |∇α| alone (2 cells) does not cancel it completely.
 //
-//    We compute Fsvt and Fsvc separately for diagnostics;
-//    the sum enters the momentum predictor.
+//    sigma_liq = alpha1*sigma + (1-alpha1)*sigma0
+//    Since sigma was built from cif (alpha-weighted) in cEqn.H,
+//    gas cells already have sigma ~ sigma0 + dsdT*(T_gas-Tr).
+//    After TEqn resets T_gas = T_gas_ref, gas cells have
+//    sigma ~ sigma0 + dsdT*(T_gas_ref - Tr) = const, so
+//    grad(sigma_liq) = 0 in pure gas automatically.
+//    The masking sigma_liq = alpha*sigma + (1-alpha)*sigma0
+//    provides additional smoothing at the transition.
 // ------------------------------------------------------------
-volVectorField gradT_vol(fvc::grad(T));
-// Use grad(sigma) directly — sigma already encodes both T and c_eff
-// Decompose: dσ/dT * ∇T  and  dσ/dc * ∇(c_eff)
-// (c_eff is not stored as a persistent field; sigma is.
-//  For the tangential split we recompute the two contributions.)
-volVectorField gradc_eff(fvc::grad(sigma - sigma0 - dsdT*(T - Tr)) / dsdc);
-// gradc_eff = ∇c_eff  recovered from sigma = sigma0 + dsdT*(T-Tr) + dsdc*(c_eff-cr)
+volScalarField sigma_liq
+(
+    IOobject("sigma_liq", runTime.timeName(), mesh,
+             IOobject::NO_READ, IOobject::NO_WRITE),
+    alpha1*sigma + (scalar(1) - alpha1)*sigma0
+);
+
+volVectorField gradSigma_liq(fvc::grad(sigma_liq));
+
+// Tangential projector: (I - n̂n̂)·∇σ
+volVectorField gradSigma_tang
+(
+    IOobject("gradSigma_tang", runTime.timeName(), mesh,
+             IOobject::NO_READ, IOobject::NO_WRITE),
+    gradSigma_liq - nHat*(nHat & gradSigma_liq)
+);
+
+// nearInterface: sharper binary mask — pos(α(1-α) - ε)
+// Multiplied WITH |∇α|, not replacing it:
+//   |∇α|          = CSF delta function = interface area per unit volume [1/m]
+//                   this is the physical localisation — must be kept
+//   nearInterface  = additional sharpening: cuts the 1-2 cell stencil
+//                   tail that |∇α| leaves in adjacent liquid cells
+//   product        = delta_s * H(α(1-α)-ε) — sharp AND area-weighted
+volScalarField nearIface(mixture.nearInterface());
+
+// Full tangential Marangoni force [N/m³]
+// F_st = [(I - n̂n̂)·∇σ_liq] * |∇α| * nearInterface
+volVectorField FMarangoni
+(
+    IOobject("FMarangoni", runTime.timeName(), mesh,
+             IOobject::NO_READ, IOobject::AUTO_WRITE),
+    gradSigma_tang * mag(gradAlpha) * nearIface
+);
+
+// Diagnostic decomposition: Fsvt (thermal) and Fsvc (solutal)
+// Same two-mask localisation: |∇α| * nearInterface
+// Both use cif for consistency with sigma update in cEqn.H / cl_cEqn.H
+volScalarField T_liq
+(
+    IOobject("T_liq", runTime.timeName(), mesh,
+             IOobject::NO_READ, IOobject::NO_WRITE),
+    alpha1*T + (scalar(1) - alpha1)*Tr
+);
+
+volVectorField gradT_liq(fvc::grad(T_liq));
+volVectorField gradCif(fvc::grad(cif));
 
 volVectorField Fsvt
 (
     IOobject("Fsvt", runTime.timeName(), mesh,
              IOobject::NO_READ, IOobject::AUTO_WRITE),
-    dsdT * (gradT_vol - nHat*(nHat & gradT_vol)) * mag(gradAlpha)
+    dsdT * (gradT_liq - nHat*(nHat & gradT_liq))
+         * mag(gradAlpha) * nearIface
 );
 
 volVectorField Fsvc
 (
     IOobject("Fsvc", runTime.timeName(), mesh,
              IOobject::NO_READ, IOobject::AUTO_WRITE),
-    dsdc * (gradc_eff - nHat*(nHat & gradc_eff)) * mag(gradAlpha)
+    dsdc * (gradCif - nHat*(nHat & gradCif))
+         * mag(gradAlpha) * nearIface
 );
 
 // ------------------------------------------------------------
@@ -116,14 +168,13 @@ if (pimple.momentumPredictor())
         fvc::reconstruct
         (
             (
-                Fsvn                      // normal Marangoni / capillary
+                Fsvn                      // normal capillary force
               - ghf*fvc::snGrad(rho)      // gravity head
               - fvc::snGrad(p_rgh)        // modified pressure
             ) * mesh.magSf()
         )
-      + Fbuoy      // Boussinesq buoyancy
-      + Fsvt       // thermal Marangoni (tangential)
-      + Fsvc       // solutal Marangoni (tangential)
+      + Fbuoy        // Boussinesq buoyancy
+      + FMarangoni   // tangential Marangoni: (I-nn).grad(sigma)*|grad(alpha)|
     );
 
     fvOptions.correct(U);
@@ -131,7 +182,8 @@ if (pimple.momentumPredictor())
 
 if (runTime.writeTime())
 {
-    Fsvt.write();
-    Fsvc.write();
+    FMarangoni.write();
+    Fsvt.write();   // diagnostic only
+    Fsvc.write();   // diagnostic only
     Fbuoy.write();
 }
