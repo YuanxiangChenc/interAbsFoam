@@ -1,175 +1,345 @@
-// UEqn.H
 // ============================================================
-// Momentum equation with variable-σ Marangoni and buoyancy.
+// cl_cEqn.H
 //
-// Tangential Marangoni follows Castro tension.c surftension():
-//   F_st = [(I-n̂n̂)·∇σ] * |∇α| * 2*α₁
-// Normal capillary from mixture.sigmaK() scaled by sigma/sigma0.
-// Buoyancy: Boussinesq with betaT and betaC per phase.
+// Liquid-concentrated cell-centre source with invadec pre-solve.
+// Ported into interAbsFoam: cSat is now a volScalarField
+// (updated by updateCSat_T.H), so all cSat.value() references
+// become per-cell cSat[celli] lookups.
+//
+// Source : 2 * D1 * (grad(cif) . grad(alpha)) * pos(alpha-0.5)
+//          Only liquid cells (alpha > 0.5) receive the source.
+//          Factor 2 rationale: with invadec2 in place, gas cells
+//          have c = cSat so grad(cif)_gas ~ 0 -- the interface
+//          signal sits almost entirely on the liquid side already.
+//          Factor 2 is therefore a mild overcount here, unlike
+//          ca_cEqn.H where gas cells had stale c and both sides
+//          carried real signal. Compare m_abs vs ca_cEqn.H to
+//          confirm: if cl gives ~2x ca, remove the 2.
+//
+// m_abs  : source * rho1 / cSat  [kg/m3/s]
+//          Consistent: source [1/s] * rho1 [kg/m3] / cSat [-]
+//          = absorbed water mass per unit volume per unit time.
+//
+// Diffusion: full laplacian(alpha*D1, c), no blocking.
+//
+// invadecThreshold (CHANGED 1e-6 -> 1e-3):
+//   Original cl_cEqn.H used a hasLiquidNeighbour threshold of
+//   alpha > 1e-6 to decide if a gas cell borders liquid. This was
+//   later found (in iv_cEqn.H debugging) to be too tight: with
+//   alpha < 1e-6 reserved for "pure gas", many genuine interface
+//   gas cells (0.01 < alpha < 0.5) fell through the gap and were
+//   NOT reset to cSat before the solve, contaminating grad(cif)
+//   and collapsing m_abs. Widening to 1e-3 catches more of the
+//   true interface band while still excluding only the deepest
+//   bulk-gas cells from the liquid-neighbour test.
 // ============================================================
 
-MRF.correctBoundaryVelocity(U);
+alpha1.max(0.0);
+alpha1.min(1.0);
 
-// ------------------------------------------------------------
-// 1. Update interface normal from current alpha
-// ------------------------------------------------------------
-gradAlpha = fvc::grad(alpha1);
-nHat      = gradAlpha / (mag(gradAlpha) + deltaN);
+const labelUList& own = mesh.owner();
+const labelUList& nei = mesh.neighbour();
 
-// ------------------------------------------------------------
-// 2. Normal surface-tension / capillary force  [Pa/m on face]
+// Threshold for "this cell counts as liquid" when building the
+// hasLiquidNeighbour mask in invadec2. Raised from 1e-6 to 1e-3
+// per request -- catches more genuine interface-band gas cells.
+const scalar invadecThreshold = 1e-3;
+
+// ============================================================
+// PRE-SOLVE A: invadec2
 //
-//    sigmaK_var = sigma(T,cif) * K  scaled from mixture.sigmaK()
-//    Fsvn enters fvc::reconstruct() consistent with interFoam.
+// Must run BEFORE cif is built so gas-side c is correct.
+//   gas cell bordering liquid (alpha of neighbour > threshold)
+//     -> c = cSat (local cell value, volScalarField)
+//   isolated gas cell (no liquid neighbour within threshold)
+//     -> c = 0
+// ============================================================
+{
+    scalarField hasLiquidNbr(mesh.nCells(), 0.0);
+    forAll(own, facei)
+    {
+        if (alpha1[own[facei]] > invadecThreshold)
+        {
+            hasLiquidNbr[nei[facei]] = 1.0;
+        }
+        if (alpha1[nei[facei]] > invadecThreshold)
+        {
+            hasLiquidNbr[own[facei]] = 1.0;
+        }
+    }
+
+    forAll(c, celli)
+    {
+        if (alpha1[celli] < invadecThreshold)
+        {
+            c[celli] = (hasLiquidNbr[celli] > 0.5)
+                     ? cSat[celli]   // interface gas cell -> local cSat
+                     : 0.0;          // isolated gas cell  -> 0
+        }
+    }
+    c.correctBoundaryConditions();
+}
+
+// ============================================================
+// PRE-SOLVE B: invadec
+//
+// Newly flooded cells (alpha now > 0.5, was <= 0.5 last step)
+// get c from flux-weighted average of liquid neighbours.
+// Uses alphaPhi10 as the VOF flux (volume of liquid per face).
+// Only inflow faces contribute (liquid arriving into cell).
+// Castro: cant[i,j] = sum(|flux_in| * c_neighbour) / sum(|flux_in|)
+// ============================================================
+{
+    const scalarField& alphaOld = alpha1.oldTime().primitiveField();
+
+    forAll(c, celli)
+    {
+        // newly flooded: was gas, now liquid
+        if (alpha1[celli] > 0.5 && alphaOld[celli] <= 0.5)
+        {
+            scalar wSum = 0.0;
+            scalar cSum = 0.0;
+
+            const labelList& faces = mesh.cells()[celli];
+            forAll(faces, fi)
+            {
+                label facei = faces[fi];
+                if (facei >= mesh.nInternalFaces()) continue; // skip boundary
+
+                label o = own[facei];
+                label n = nei[facei];
+                label nbr = (o == celli) ? n : o;
+
+                // only liquid neighbours contribute
+                if (alpha1[nbr] <= 0.5) continue;
+
+                // VOF flux: alphaPhi10 is volume of liquid per face per dt
+                // positive = owner->neighbour direction
+                scalar flux = alphaPhi10[facei];
+
+                // inflow into celli:
+                //   celli is owner     -> inflow when flux < 0
+                //   celli is neighbour -> inflow when flux > 0
+                scalar influx = (o == celli) ? max(-flux, 0.0)
+                                              : max( flux, 0.0);
+
+                if (influx > 0.0)
+                {
+                    wSum += influx;
+                    cSum += influx * c[nbr];
+                }
+            }
+
+            if (wSum > SMALL)
+            {
+                c[celli] = cSum / wSum;
+            }
+            // else: no inflow from liquid neighbours, keep current c
+        }
+    }
+    c.correctBoundaryConditions();
+}
+
 // ------------------------------------------------------------
-volScalarField sigmaK_var
+// 1. Interface gradient magnitude
+//    gradAlpha_mag = |∇α| — used for diagnostics and integral
+//    (gradAlphaVec built in step 2 for the dot product)
+// ------------------------------------------------------------
+volScalarField gradAlpha_mag(mag(fvc::grad(alpha1)));
+
+// ------------------------------------------------------------
+// 2. Blended cell-centre concentration (cif) and Castro-style
+//    cell-centre absorption source
+//
+//    cif = alpha1*c + (1-alpha1)*cSat
+//
+//    source = 2 * D1 * (grad(cif) . grad(alpha))
+//
+//    NO alpha1 weighting. |grad(alpha)| already concentrates the
+//    source to the 1-2 cell interface band — it is the CSF delta
+//    function (interface area per unit volume). Multiplying by
+//    alpha1 on top of that is redundant localisation that
+//    ATTENUATES the source exactly where it should be strongest:
+//    at the interface cell itself, alpha~0.5, so an alpha1 factor
+//    would halve the source there for no physical reason.
+//
+//    Why Castro's FF doesn't transfer directly: Castro's grid
+//    refines the interface-normal calculation onto a 2n x 2m
+//    sub-grid (calcN), and FF in his formula plays a role specific
+//    to that staggered/refined bookkeeping. In OpenFOAM's collocated
+//    cell-centred grid, fvc::grad(alpha1) already IS the localised
+//    interface signal — no staggering correction is needed, and no
+//    second alpha-based mask should be layered on top of it.
+//
+//    The factor 2 is retained as a constant (not 2*alpha1) — it
+//    reflects Castro's two-sided finite-difference stencil
+//    (E+W, N+S contributions) and applies uniformly wherever
+//    |grad(alpha)| is non-zero.
+//
+//    Contrast with Q_abs / m_abs: those are VOLUMETRIC sources that
+//    must integrate correctly over the liquid sub-domain for mass
+//    conservation, so an alpha-based occupancy weight is legitimate
+//    there. The interfacial source here is not a volume-integrated
+//    quantity in the same sense — it only needs to vanish away from
+//    the interface, which |grad(alpha)| already guarantees alone.
+//
+//    NOTE: absSource CAN be negative if grad(cif).grad(alpha) < 0,
+//    which happens when c < cSat (desorption) or during VOF alpha
+//    oscillations near the interface. The source is clamped to
+//    zero (absorption-only) before being used for m_abs and the
+//    c-equation RHS.
+// ------------------------------------------------------------
+cif = alpha1*c + (scalar(1) - alpha1)*cSat;
+
+volVectorField gradCif(fvc::grad(cif));
+volVectorField gradAlphaVec(fvc::grad(alpha1));
+
+// Raw source — can be negative (desorption / alpha oscillation)
+volScalarField absSourceRaw
 (
-    IOobject("sigmaK_var", runTime.timeName(), mesh,
+    IOobject("absSourceRaw", mesh.time().timeName(), mesh,
              IOobject::NO_READ, IOobject::NO_WRITE),
-    mixture.sigmaK() * (sigma / sigma0)
+    scalar(2) * D1 * (gradCif & gradAlphaVec)
 );
 
-surfaceScalarField Fsvn
+// Clamped source for m_abs and c-equation RHS (absorption only)
+volScalarField absSource
 (
-    IOobject("Fsvn", runTime.timeName(), mesh,
-             IOobject::NO_READ, IOobject::NO_WRITE),
-    fvc::interpolate(sigmaK_var) * fvc::snGrad(alpha1)
-);
-
-// ------------------------------------------------------------
-// 3. Tangential Marangoni force  [N/m³]
-//
-//    Castro tension.c surftension() exact form:
-//      Ftx = 2*(Tx²*sigt*dT/dx + Tx²*sigc*dc/dx
-//             +Tx*Ty*sigt*dT/dy + Tx*Ty*sigc*dc/dy) * |N| * FF
-//
-//    Tensor form:  F_st = [(I-n̂n̂)·∇σ] * |∇α| * 2*α₁
-//
-//    |∇α| = |N|  : CSF delta function [1/m], interface area/volume
-//    2*α₁ = 2*FF : Castro's only localisation — zero in gas,
-//                  half-weight at interface, full in bulk liquid
-//                  (but |∇α|=0 in bulk so product is zero there)
-//    factor 2    : from Castro's two-sided finite-difference stencil
-//                  (E+W, N+S averaging), retained to match calibration
-//
-//    sigma_liq = alpha1*sigma + (1-alpha1)*sigma0
-//    Gas cells see sigma0 (flat) → grad(sigma_liq)=0 in pure gas.
-//    One-sided gradient at interface is preserved.
-// ------------------------------------------------------------
-volScalarField sigma_liq
-(
-    IOobject("sigma_liq", runTime.timeName(), mesh,
-             IOobject::NO_READ, IOobject::NO_WRITE),
-    alpha1*sigma + (scalar(1) - alpha1)*sigma0
-);
-
-volVectorField gradSigma_liq(fvc::grad(sigma_liq));
-
-// Tangential projector: (I - n̂n̂)·∇σ  [N/m²]
-volVectorField gradSigma_tang
-(
-    IOobject("gradSigma_tang", runTime.timeName(), mesh,
-             IOobject::NO_READ, IOobject::NO_WRITE),
-    gradSigma_liq - nHat*(nHat & gradSigma_liq)
-);
-
-// F_Marangoni = [(I-n̂n̂)·∇σ] * |∇α| * 2*α₁   [N/m³]
-volVectorField FMarangoni
-(
-    IOobject("FMarangoni", runTime.timeName(), mesh,
-             IOobject::NO_READ, IOobject::AUTO_WRITE),
-    gradSigma_tang * mag(gradAlpha) * scalar(2) * alpha1
-);
-
-// Diagnostic decomposition into thermal (Fsvt) and solutal (Fsvc)
-// Same Castro localisation: |∇α| * 2*alpha1
-// T_liq = alpha1*T + (1-alpha1)*Tr  — one-sided T gradient
-// cif already updated in cEqn.H/cl_cEqn.H before UEqn runs
-volScalarField T_liq
-(
-    IOobject("T_liq", runTime.timeName(), mesh,
-             IOobject::NO_READ, IOobject::NO_WRITE),
-    alpha1*T + (scalar(1) - alpha1)*Tr
-);
-
-volVectorField gradT_liq(fvc::grad(T_liq));
-volVectorField gradCif_v(fvc::grad(cif));
-
-volVectorField Fsvt
-(
-    IOobject("Fsvt", runTime.timeName(), mesh,
-             IOobject::NO_READ, IOobject::AUTO_WRITE),
-    dsdT * (gradT_liq - nHat*(nHat & gradT_liq))
-         * mag(gradAlpha) * scalar(2) * alpha1
-);
-
-volVectorField Fsvc
-(
-    IOobject("Fsvc", runTime.timeName(), mesh,
-             IOobject::NO_READ, IOobject::AUTO_WRITE),
-    dsdc * (gradCif_v - nHat*(nHat & gradCif_v))
-         * mag(gradAlpha) * scalar(2) * alpha1
-);
-
-// ------------------------------------------------------------
-// 4. Buoyancy (Boussinesq)  [N/m³]
-//
-//    Fbuoy = -g * [α₁ρ₁ʳᵉᶠ(βT₁ΔT + βC₁Δc)
-//                +α₂ρ₂ʳᵉᶠ(βT₂ΔT + βC₂Δc)]
-//    ΔT = T - Tr,  Δc = c - cr
-//    betaC1 = -11.09 per unit mass fraction (×100 from Castro wt%)
-// ------------------------------------------------------------
-volVectorField Fbuoy
-(
-    IOobject("Fbuoy", runTime.timeName(), mesh,
-             IOobject::NO_READ, IOobject::AUTO_WRITE),
-    -g *
+    IOobject
     (
-        alpha1 * rho1Ref * (betaT1*(T - Tr) + betaC1*(c - cr))
-      + alpha2 * rho2Ref * (betaT2*(T - Tr) + betaC2*(c - cr))
+        "absSource",
+        mesh.time().timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::AUTO_WRITE
+    ),
+    max
+    (
+        absSourceRaw,
+        dimensionedScalar("zero", absSourceRaw.dimensions(), 0.0)
     )
 );
 
 // ------------------------------------------------------------
-// 5. Momentum equation
+// 3. Diffusivity field (no blocking -- full mixture diffusion)
 // ------------------------------------------------------------
-fvVectorMatrix UEqn
+Df = fvc::interpolate(alpha1) * D1;
+
+// ------------------------------------------------------------
+// 4. Concentration equation
+//
+//    ddt(c) + div(phi,c) - laplacian(Df,c) = -absSource
+//
+//    Gas cells evolve freely via convection after solve.
+//    invadec2 resets them again before next time step's solve.
+// ------------------------------------------------------------
+fvScalarMatrix cEqnM
 (
-    fvm::ddt(rho, U) + fvm::div(rhoPhi, U)
-  + MRF.DDt(rho, U)
-  + turbulence->divDevRhoReff(rho, U)
+    fvm::ddt(c)
+  + fvm::div(phi, c)
+  - fvm::laplacian(Df, c)
  ==
-    fvOptions(rho, U)
+  - absSource
 );
 
-UEqn.relax();
-fvOptions.constrain(UEqn);
+fvOptions.constrain(cEqnM);
+cEqnM.relax();
+cEqnM.solve();
+fvOptions.correct(c);
 
-if (pimple.momentumPredictor())
+c.max(0.0);
+c.min(1.0);
+
+// ------------------------------------------------------------
+// 5. m_abs  [kg/m3/s]
+//
+//    Castro absTCv: mabs = rho1/cp * D*(grad(cif).N)*FF*dV
+//    Isothermal limit: cp -> cSat
+//    mabs = (rho1/cSat) * absSource
+//
+//    absSource is already clamped >= 0 so m_abs >= 0 always.
+//    (Negative dot product = desorption / alpha oscillation —
+//    not a physical absorption event, excluded from accumulation.)
+// ------------------------------------------------------------
 {
-    solve
-    (
-        UEqn
-     ==
-        fvc::reconstruct
-        (
-            (
-                Fsvn                      // normal capillary
-              - ghf*fvc::snGrad(rho)      // gravity head
-              - fvc::snGrad(p_rgh)        // modified pressure
-            ) * mesh.magSf()
-        )
-      + Fbuoy        // Boussinesq buoyancy
-      + FMarangoni   // tangential Marangoni: Castro 2*FF*|N|*(I-nn).grad(sigma)
-    );
+    scalarField& mabsRef = m_abs.primitiveFieldRef();
+    const scalarField& srcRef = absSource.primitiveField();  // clamped
+    const scalarField& cSatRef = cSat.primitiveField();
 
-    fvOptions.correct(U);
+    forAll(mabsRef, celli)
+    {
+        scalar cSatLocal = max(cSatRef[celli], scalar(1e-6));
+        mabsRef[celli] = srcRef[celli] * rho1.value() / cSatLocal;
+    }
+    m_abs.correctBoundaryConditions();
 }
+
+// ------------------------------------------------------------
+// 6. Update sigma using cif  (mirrors cEqn.H step 11)
+//
+//    cif was updated at step 2 above:
+//      cif = alpha1*c + (1-alpha1)*cSat
+//    sigma = sigma0 + dsdT*(T - Tr) + dsdc*(cif - cr)
+//
+//    UNIT NOTE (transportProperties):
+//      dsdc [N/m per unit mass fraction 0-1]
+//           Castro -6.4e-4 is per wt% -> enter -6.4e-2
+//      cr   must equal c0 = 0.5522 (NOT cSat0)
+// ------------------------------------------------------------
+sigma = sigma0 + dsdT*(T - Tr) + dsdc*(cif - cr);
+sigma.max(dimensionedScalar("sigMin", sigma.dimensions(), 1e-4));
+
+Info<< "sigma range:  " << gMin(sigma.primitiveField())
+    << " – " << gMax(sigma.primitiveField())
+    << "  (sigma0 = " << sigma0.value() << " N/m)" << endl;
+
+// ------------------------------------------------------------
+// 7. Update rhoCp and rhoCpPhi
+// ------------------------------------------------------------
+rhoCp    = alpha1*rho1*cp1 + alpha2*rho2*cp2;
+rhoCpPhi = fvc::interpolate(rhoCp)*phi;
+
+// ------------------------------------------------------------
+// 8. Diagnostics
+// ------------------------------------------------------------
+const scalar domainVol = gSum(mesh.V().field());
+const scalar lx        = 0.076;
+const scalar ly        = 0.020;
+const scalar dz        = domainVol / (lx * ly);
+
+const scalar dt    = runTime.deltaTValue();
+const scalar GmAbs = fvc::domainIntegrate(m_abs).value();
+Mabs_acc += GmAbs * dt;
+
+// interface area proxy: integral of |grad(alpha)|
+const scalar intNorm = fvc::domainIntegrate(gradAlpha_mag).value();
+
+Info<< "min/max(c)          = " << min(c).value()
+    << " / " << max(c).value() << endl;
+Info<< "min/max(cSat)       = " << gMin(cSat) << " / " << gMax(cSat) << endl;
+Info<< "min/max(cif)        = " << min(cif).value()
+    << " / " << max(cif).value() << endl;
+Info<< "min/max(absSource)  = " << min(absSource).value()
+    << " / " << max(absSource).value() << endl;
+Info<< "invadecThreshold    = " << invadecThreshold << endl;
+Info<< "int|N|*liquid [m2]  = " << intNorm << endl;
+Info<< "m_abs [kg/s]        = " << GmAbs << endl;
+Info<< "m_abs/dz [kg/m/s]   = " << GmAbs/dz << endl;
+Info<< "Mabs_acc [kg]       = " << Mabs_acc << endl;
+Info<< "Mabs/dz  [kg/m]     = " << Mabs_acc/dz << endl;
 
 if (runTime.writeTime())
 {
-    FMarangoni.write();
-    Fsvt.write();
-    Fsvc.write();
-    Fbuoy.write();
+    m_abs.write();
+    cif.write();
+    absSource.write();
+}
+
+if ((runTime.timeIndex() % absWriteInterval) == 0)
+{
+    (*absFilePtr) << runTime.value() << " "
+                  << Mabs_acc        << " "
+                  << Mabs_acc/dz
+                  << nl;
+    absFilePtr->flush();
 }

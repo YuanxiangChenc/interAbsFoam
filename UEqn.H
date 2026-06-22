@@ -39,18 +39,25 @@ surfaceScalarField Fsvn
 // ------------------------------------------------------------
 // 3. Tangential Marangoni force  [N/m³]
 //
-//    Castro tension.c surftension() exact form:
-//      Ftx = 2*(Tx²*sigt*dT/dx + Tx²*sigc*dc/dx
-//             +Tx*Ty*sigt*dT/dy + Tx*Ty*sigc*dc/dy) * |N| * FF
+//    F_st = [(I-n̂n̂)·∇σ] * |∇α| * 2
 //
-//    Tensor form:  F_st = [(I-n̂n̂)·∇σ] * |∇α| * 2*α₁
+//    |∇α| : CSF delta function [1/m] — interface area per unit
+//           volume. Already concentrates the force to the 1-2
+//           cell interface band: zero in bulk liquid, zero in
+//           bulk gas, peaked at the interface.
 //
-//    |∇α| = |N|  : CSF delta function [1/m], interface area/volume
-//    2*α₁ = 2*FF : Castro's only localisation — zero in gas,
-//                  half-weight at interface, full in bulk liquid
-//                  (but |∇α|=0 in bulk so product is zero there)
-//    factor 2    : from Castro's two-sided finite-difference stencil
-//                  (E+W, N+S averaging), retained to match calibration
+//    NO alpha1 weighting on top of |∇α|. Castro's grid refines
+//    the interface-normal computation onto a 2n x 2m sub-grid
+//    (calcN) — his FF factor plays a role specific to that
+//    staggered/refined bookkeeping. In OpenFOAM's collocated
+//    cell-centred grid, fvc::grad(alpha1) already IS the
+//    localised interface signal; layering alpha1 on top is
+//    redundant and actually attenuates the force exactly at the
+//    interface cell (alpha~0.5), where it should be strongest.
+//
+//    factor 2: constant, from Castro's two-sided finite-difference
+//    stencil (E+W, N+S averaging) — applies uniformly wherever
+//    |∇α| is non-zero, not weighted by alpha1.
 //
 //    sigma_liq = alpha1*sigma + (1-alpha1)*sigma0
 //    Gas cells see sigma0 (flat) → grad(sigma_liq)=0 in pure gas.
@@ -73,16 +80,16 @@ volVectorField gradSigma_tang
     gradSigma_liq - nHat*(nHat & gradSigma_liq)
 );
 
-// F_Marangoni = [(I-n̂n̂)·∇σ] * |∇α| * 2*α₁   [N/m³]
+// F_Marangoni = [(I-n̂n̂)·∇σ] * |∇α| * 2   [N/m³]
 volVectorField FMarangoni
 (
     IOobject("FMarangoni", runTime.timeName(), mesh,
              IOobject::NO_READ, IOobject::AUTO_WRITE),
-    gradSigma_tang * mag(gradAlpha) * scalar(2) * alpha1
+    gradSigma_tang * mag(gradAlpha) * scalar(2)
 );
 
 // Diagnostic decomposition into thermal (Fsvt) and solutal (Fsvc)
-// Same Castro localisation: |∇α| * 2*alpha1
+// Same localisation: |∇α| * 2  (no alpha1 weighting — see above)
 // T_liq = alpha1*T + (1-alpha1)*Tr  — one-sided T gradient
 // cif already updated in cEqn.H/cl_cEqn.H before UEqn runs
 volScalarField T_liq
@@ -100,7 +107,7 @@ volVectorField Fsvt
     IOobject("Fsvt", runTime.timeName(), mesh,
              IOobject::NO_READ, IOobject::AUTO_WRITE),
     dsdT * (gradT_liq - nHat*(nHat & gradT_liq))
-         * mag(gradAlpha) * scalar(2) * alpha1
+         * mag(gradAlpha) * scalar(2)
 );
 
 volVectorField Fsvc
@@ -108,7 +115,7 @@ volVectorField Fsvc
     IOobject("Fsvc", runTime.timeName(), mesh,
              IOobject::NO_READ, IOobject::AUTO_WRITE),
     dsdc * (gradCif_v - nHat*(nHat & gradCif_v))
-         * mag(gradAlpha) * scalar(2) * alpha1
+         * mag(gradAlpha) * scalar(2)
 );
 
 // ------------------------------------------------------------
