@@ -39,25 +39,30 @@ surfaceScalarField Fsvn
 // ------------------------------------------------------------
 // 3. Tangential Marangoni force  [N/m³]
 //
-//    F_st = [(I-n̂n̂)·∇σ] * |∇α| * 2
+//    F_st = [(I-n̂n̂)·∇σ] * |∇α| * 2 * pos(α₁-0.5)
 //
 //    |∇α| : CSF delta function [1/m] — interface area per unit
-//           volume. Already concentrates the force to the 1-2
-//           cell interface band: zero in bulk liquid, zero in
-//           bulk gas, peaked at the interface.
+//           volume. SYMMETRIC across the interface: a centred
+//           difference picks up the alpha jump equally on the
+//           liquid-side cell AND the gas-side cell straddling it.
 //
-//    NO alpha1 weighting on top of |∇α|. Castro's grid refines
-//    the interface-normal computation onto a 2n x 2m sub-grid
-//    (calcN) — his FF factor plays a role specific to that
-//    staggered/refined bookkeeping. In OpenFOAM's collocated
-//    cell-centred grid, fvc::grad(alpha1) already IS the
-//    localised interface signal; layering alpha1 on top is
-//    redundant and actually attenuates the force exactly at the
-//    interface cell (alpha~0.5), where it should be strongest.
+//    pos(α₁-0.5) : binary liquid-side selector (1 if α₁>0.5, else 0).
+//           This is NOT the same mistake as the removed alpha1
+//           weighting. alpha1 is a CONTINUOUS attenuator that
+//           weakens the force at the interface cell itself
+//           (alpha~0.5 → factor 0.5). pos(alpha1-0.5) is a BINARY
+//           gate that does not touch the magnitude on the liquid
+//           side — it only zeroes the mirror contribution that
+//           |∇α| deposits on the gas-side cell of the same
+//           interface pair. Without this gate, *2 double-counts:
+//           both the liquid cell and its gas neighbour receive the
+//           full doubled force from the same interface jump.
 //
 //    factor 2: constant, from Castro's two-sided finite-difference
-//    stencil (E+W, N+S averaging) — applies uniformly wherever
-//    |∇α| is non-zero, not weighted by alpha1.
+//    stencil (E+W, N+S averaging) — combined with the liquid-side
+//    gate, deposits the full interfacial force once, on the liquid
+//    side only. Matches the same pattern used in cl_cEqn.H for
+//    absSource: 2*D1*(gradCif & gradAlpha) * pos(alpha1-0.5).
 //
 //    sigma_liq = alpha1*sigma + (1-alpha1)*sigma0
 //    Gas cells see sigma0 (flat) → grad(sigma_liq)=0 in pure gas.
@@ -80,16 +85,26 @@ volVectorField gradSigma_tang
     gradSigma_liq - nHat*(nHat & gradSigma_liq)
 );
 
-// F_Marangoni = [(I-n̂n̂)·∇σ] * |∇α| * 2   [N/m³]
+// Binary liquid-side gate: 1 where alpha1>0.5, 0 where alpha1<=0.5
+// Same gate used in cl_cEqn.H for absSource — keeps both equations
+// consistent in how they localise to the liquid side of the interface.
+volScalarField liquidGate
+(
+    IOobject("liquidGate", runTime.timeName(), mesh,
+             IOobject::NO_READ, IOobject::NO_WRITE),
+    pos(alpha1 - dimensionedScalar("half", dimless, 0.5))
+);
+
+// F_Marangoni = [(I-n̂n̂)·∇σ] * |∇α| * 2 * liquidGate   [N/m³]
 volVectorField FMarangoni
 (
     IOobject("FMarangoni", runTime.timeName(), mesh,
              IOobject::NO_READ, IOobject::AUTO_WRITE),
-    gradSigma_tang * mag(gradAlpha) * scalar(2)
+    gradSigma_tang * mag(gradAlpha) * scalar(2) * liquidGate
 );
 
 // Diagnostic decomposition into thermal (Fsvt) and solutal (Fsvc)
-// Same localisation: |∇α| * 2  (no alpha1 weighting — see above)
+// Same localisation: |∇α| * 2 * liquidGate
 // T_liq = alpha1*T + (1-alpha1)*Tr  — one-sided T gradient
 // cif already updated in cEqn.H/cl_cEqn.H before UEqn runs
 volScalarField T_liq
@@ -107,7 +122,7 @@ volVectorField Fsvt
     IOobject("Fsvt", runTime.timeName(), mesh,
              IOobject::NO_READ, IOobject::AUTO_WRITE),
     dsdT * (gradT_liq - nHat*(nHat & gradT_liq))
-         * mag(gradAlpha) * scalar(2)
+         * mag(gradAlpha) * scalar(2) * liquidGate
 );
 
 volVectorField Fsvc
@@ -115,7 +130,7 @@ volVectorField Fsvc
     IOobject("Fsvc", runTime.timeName(), mesh,
              IOobject::NO_READ, IOobject::AUTO_WRITE),
     dsdc * (gradCif_v - nHat*(nHat & gradCif_v))
-         * mag(gradAlpha) * scalar(2)
+         * mag(gradAlpha) * scalar(2) * liquidGate
 );
 
 // ------------------------------------------------------------

@@ -153,35 +153,40 @@ volScalarField gradAlpha_mag(mag(fvc::grad(alpha1)));
 //
 //    cif = alpha1*c + (1-alpha1)*cSat
 //
-//    source = 2 * D1 * (grad(cif) . grad(alpha))
+//    source = 2 * D1 * (grad(cif) . grad(alpha)) * pos(alpha1-0.5)
 //
-//    NO alpha1 weighting. |grad(alpha)| already concentrates the
-//    source to the 1-2 cell interface band — it is the CSF delta
-//    function (interface area per unit volume). Multiplying by
-//    alpha1 on top of that is redundant localisation that
-//    ATTENUATES the source exactly where it should be strongest:
-//    at the interface cell itself, alpha~0.5, so an alpha1 factor
-//    would halve the source there for no physical reason.
+//    liquidGate = pos(alpha1-0.5): BINARY gate, 1 if alpha1>0.5
+//    else 0. This is NOT the alpha1 continuous weighting that was
+//    correctly removed earlier (that one attenuated the source at
+//    the interface cell itself, alpha~0.5 -> factor 0.5, which was
+//    wrong). The binary gate does a different job:
+//
+//    |grad(alpha)| is built from a CENTRED difference, so it is
+//    SYMMETRIC across the interface — it picks up the same jump
+//    magnitude on the liquid-side cell AND the gas-side cell that
+//    straddle the interface. Without a liquid/gas selector, the *2
+//    factor deposits the full doubled source on BOTH sides of the
+//    interface band, double-counting the same physical jump.
+//
+//    liquidGate keeps the full magnitude on the liquid side (no
+//    attenuation there) and zeroes only the mirror copy that
+//    |grad(alpha)| would otherwise deposit in the gas-side cell.
+//    This matches the binary liquidGate used in UEqn.H for
+//    FMarangoni/Fsvt/Fsvc — both equations now use the same
+//    liquid-side localisation convention.
 //
 //    Why Castro's FF doesn't transfer directly: Castro's grid
 //    refines the interface-normal calculation onto a 2n x 2m
 //    sub-grid (calcN), and FF in his formula plays a role specific
 //    to that staggered/refined bookkeeping. In OpenFOAM's collocated
 //    cell-centred grid, fvc::grad(alpha1) already IS the localised
-//    interface signal — no staggering correction is needed, and no
-//    second alpha-based mask should be layered on top of it.
+//    interface signal — the binary liquidGate is what restricts
+//    deposition to the liquid side, not a continuous alpha1 weight.
 //
 //    The factor 2 is retained as a constant (not 2*alpha1) — it
 //    reflects Castro's two-sided finite-difference stencil
-//    (E+W, N+S contributions) and applies uniformly wherever
-//    |grad(alpha)| is non-zero.
-//
-//    Contrast with Q_abs / m_abs: those are VOLUMETRIC sources that
-//    must integrate correctly over the liquid sub-domain for mass
-//    conservation, so an alpha-based occupancy weight is legitimate
-//    there. The interfacial source here is not a volume-integrated
-//    quantity in the same sense — it only needs to vanish away from
-//    the interface, which |grad(alpha)| already guarantees alone.
+//    (E+W, N+S contributions) and, combined with liquidGate,
+//    deposits the full interfacial source once, on the liquid side.
 //
 //    NOTE: absSource CAN be negative if grad(cif).grad(alpha) < 0,
 //    which happens when c < cSat (desorption) or during VOF alpha
@@ -194,12 +199,21 @@ cif = alpha1*c + (scalar(1) - alpha1)*cSat;
 volVectorField gradCif(fvc::grad(cif));
 volVectorField gradAlphaVec(fvc::grad(alpha1));
 
+// Binary liquid-side gate: 1 where alpha1>0.5, 0 where alpha1<=0.5
+// Same gate used in UEqn.H for FMarangoni/Fsvt/Fsvc
+volScalarField liquidGate
+(
+    IOobject("liquidGate", mesh.time().timeName(), mesh,
+             IOobject::NO_READ, IOobject::NO_WRITE),
+    pos(alpha1 - dimensionedScalar("half", dimless, 0.5))
+);
+
 // Raw source — can be negative (desorption / alpha oscillation)
 volScalarField absSourceRaw
 (
     IOobject("absSourceRaw", mesh.time().timeName(), mesh,
              IOobject::NO_READ, IOobject::NO_WRITE),
-    scalar(2) * D1 * (gradCif & gradAlphaVec)
+    scalar(2) * D1 * (gradCif & gradAlphaVec) * liquidGate
 );
 
 // Clamped source for m_abs and c-equation RHS (absorption only)
@@ -322,7 +336,7 @@ Info<< "min/max(cif)        = " << min(cif).value()
 Info<< "min/max(absSource)  = " << min(absSource).value()
     << " / " << max(absSource).value() << endl;
 Info<< "invadecThreshold    = " << invadecThreshold << endl;
-Info<< "int|N|*liquid [m2]  = " << intNorm << endl;
+Info<< "int|grad(alpha)| [m2] = " << intNorm << endl;
 Info<< "m_abs [kg/s]        = " << GmAbs << endl;
 Info<< "m_abs/dz [kg/m/s]   = " << GmAbs/dz << endl;
 Info<< "Mabs_acc [kg]       = " << Mabs_acc << endl;
