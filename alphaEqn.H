@@ -246,6 +246,8 @@
     )
     {
         rhoPhi = alphaPhi10*(rho1f - rho2f) + phiCN*rho2f;
+	//update heat flux coeff
+	rhoCpPhi = alphaPhi10*(rho1f * cp1 - rho2f * cp2) + phiCN * rho2f * cp2;
     }
     else
     {
@@ -258,6 +260,8 @@
 
         // Calculate the end-of-time-step mass flux
         rhoPhi = alphaPhi10*(rho1f - rho2f) + phi*rho2f;
+	// Add end-of-time heat flux
+	rhoCpPhi = alphaPhi10*(rho1f * cp1 - rho2 * cp2) + phi * rho2f * cp2;
     }
 
     Info<< "Phase-1 volume fraction = "

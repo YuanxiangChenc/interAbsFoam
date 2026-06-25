@@ -39,3 +39,6 @@ else
 }
 
 rho == alpha1*rho1 + alpha2*rho2;
+// update rhoCp
+rhoCp = alpha1 * rho1 * cp1 + alpha2 * rho2 * cp2;
+
