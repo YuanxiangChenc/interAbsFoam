@@ -64,25 +64,19 @@ surfaceScalarField Fsvn
 //    side only. Matches the same pattern used in cl_cEqn.H for
 //    absSource: 2*D1*(gradCif & gradAlpha) * pos(alpha1-0.5).
 //
-//    sigma_liq = alpha1*sigma + (1-alpha1)*sigma0
-//    Gas cells see sigma0 (flat) → grad(sigma_liq)=0 in pure gas.
-//    One-sided gradient at interface is preserved.
+//    sigma is already built from cif = alpha1*c + (1-alpha1)*cSat
+//    in cEqn.H / cl_cEqn.H. In gas cells cif = cSat and T is anchored
+//    to Tr, so sigma naturally collapses to sigma0 there — no extra
+//    sigma_liq masking is needed. Use grad(sigma) directly.
 // ------------------------------------------------------------
-volScalarField sigma_liq
-(
-    IOobject("sigma_liq", runTime.timeName(), mesh,
-             IOobject::NO_READ, IOobject::NO_WRITE),
-    alpha1*sigma + (scalar(1) - alpha1)*sigma0
-);
-
-volVectorField gradSigma_liq(fvc::grad(sigma_liq));
+volVectorField gradSigma(fvc::grad(sigma));
 
 // Tangential projector: (I - n̂n̂)·∇σ  [N/m²]
 volVectorField gradSigma_tang
 (
     IOobject("gradSigma_tang", runTime.timeName(), mesh,
              IOobject::NO_READ, IOobject::NO_WRITE),
-    gradSigma_liq - nHat*(nHat & gradSigma_liq)
+    gradSigma - nHat*(nHat & gradSigma)
 );
 
 // Binary liquid-side gate: 1 where alpha1>0.5, 0 where alpha1<=0.5

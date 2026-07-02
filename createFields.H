@@ -108,6 +108,8 @@ const dimensionedScalar& D1 = mixture.D1();
 const dimensionedScalar& D2 = mixture.D2();
 const dimensionedScalar& cp1 = mixture.cp1();
 const dimensionedScalar& cp2 = mixture.cp2();
+const dimensionedScalar& kappa1 = mixture.kappa1();
+const dimensionedScalar& kappa2 = mixture.kappa2();
 
 
 //-----------------------------------------
@@ -372,7 +374,10 @@ volScalarField rhoCp
 );
 rhoCp.oldTime();        //what does it do? to calc first strp of ddt(rhoCp)?
 
-// heat flux
+// heat flux — initial construction only (alphaPhi10 not yet declared).
+// Updated CONSISTENTLY every time step in cEqn.H / cl_cEqn.H using:
+//   rhoCpPhi = alphaPhi10*(rho1*cp1-rho2*cp2) + phi*(rho2*cp2)
+// to guarantee discrete conservation ddt(rhoCp)+div(rhoCpPhi)≈0.
 surfaceScalarField rhoCpPhi
 (
     IOobject
@@ -492,6 +497,7 @@ autoPtr<OFstream> absFilePtr
     new OFstream(absDir/"absorptionAccum.dat")
 );
 
-// Header — consistent across both cEqn variants
-(*absFilePtr) << "# Time[s]  Mabs_acc[kg]  Mabs_acc_dz[kg/m]  GmAbsB[kg/s]  mean_c_liq[-]  mean_coeffB[1/s]  intGradAlpha[m2]" << nl;
+// Header — matches the 3 columns actually written by cEqn.H / cl_cEqn.H:
+//   runTime.value(), Mabs_acc, Mabs_acc/dz
+(*absFilePtr) << "# Time[s]  Mabs_acc[kg]  Mabs_acc_dz[kg/m]" << nl;
 absFilePtr->flush();
