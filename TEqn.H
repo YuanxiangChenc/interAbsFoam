@@ -51,7 +51,7 @@ T.correctBoundaryConditions();
 //   R_total = R_liquid + R_gas
 // The effective conductivity is the harmonic mean:
 //   kappaf = 2*k1*k2 / (k1+k2)  (weighted by liquid fraction on each side)
-//
+// 
 // For our case: k1=0.44, k2=0.018 → harmonic mean = 0.035 W/(m K)
 // vs arithmetic mean = 0.228 W/(m K) (6.5× larger — physically wrong).
 //

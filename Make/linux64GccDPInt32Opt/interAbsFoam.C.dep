@@ -959,6 +959,14 @@ $(WM_PROJECT_DIR)/src/finiteVolume/lnInclude/createPisoControl.H \
 $(WM_PROJECT_DIR)/src/finiteVolume/lnInclude/createPimpleControl.H \
 $(WM_PROJECT_DIR)/src/finiteVolume/lnInclude/createSimpleControl.H \
 $(WM_PROJECT_DIR)/src/finiteVolume/lnInclude/createTimeControls.H \
+createFields.H \
+$(WM_PROJECT_DIR)/src/finiteVolume/lnInclude/createRDeltaT.H \
+$(WM_PROJECT_DIR)/src/finiteVolume/lnInclude/createPhi.H \
+$(WM_PROJECT_DIR)/src/finiteVolume/lnInclude/readGravitationalAcceleration.H \
+$(WM_PROJECT_DIR)/src/finiteVolume/lnInclude/readhRef.H \
+$(WM_PROJECT_DIR)/src/finiteVolume/lnInclude/gh.H \
+$(WM_PROJECT_DIR)/src/finiteVolume/lnInclude/createMRF.H \
+$(WM_PROJECT_DIR)/src/finiteVolume/lnInclude/createFvOptions.H \
 createAlphaFluxes.H \
 initCorrectPhi.H \
 correctPhi.H \

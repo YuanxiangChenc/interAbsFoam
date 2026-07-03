@@ -108,8 +108,52 @@ const dimensionedScalar& D1 = mixture.D1();
 const dimensionedScalar& D2 = mixture.D2();
 const dimensionedScalar& cp1 = mixture.cp1();
 const dimensionedScalar& cp2 = mixture.cp2();
-const dimensionedScalar& kappa1 = mixture.kappa1();
-const dimensionedScalar& kappa2 = mixture.kappa2();
+const dimensionedScalar& Pr1 = mixture.Pr1();
+const dimensionedScalar& Pr2 = mixture.Pr2();
+
+// Thermal conductivity kappa is NOT stored directly in the mixture
+// class (there is no mixture.kappa1() accessor). Derive it from
+// the definition of the Prandtl number:
+//
+//   Pr = mu * cp / kappa   →   kappa = mu * cp / Pr = rho * nu * cp / Pr
+//
+// nuModel->nu() returns a volScalarField (spatially varying because
+// viscosity models like Arrhenius depend on T). For Newtonian phases
+// nu is uniform, so we take the domain average to reduce it to a
+// scalar for TEqn.H's face-field construction below.
+//
+// If a spatially varying kappa is ever needed, build kappa1_field
+// and kappa2_field as volScalarFields directly using nuModel->nu().
+Info<< "Deriving kappa1, kappa2 from rho * nu * cp / Pr\n" << endl;
+
+const dimensionedScalar nu1_avg
+(
+    "nu1_avg",
+    dimensionSet(0, 2, -1, 0, 0, 0, 0),
+    gAverage(mixture.nuModel1().nu()())
+);
+const dimensionedScalar nu2_avg
+(
+    "nu2_avg",
+    dimensionSet(0, 2, -1, 0, 0, 0, 0),
+    gAverage(mixture.nuModel2().nu()())
+);
+
+const dimensionedScalar kappa1
+(
+    "kappa1",
+    dimensionSet(1, 1, -3, -1, 0, 0, 0),
+    rho1.value() * nu1_avg.value() * cp1.value() / Pr1.value()
+);
+const dimensionedScalar kappa2
+(
+    "kappa2",
+    dimensionSet(1, 1, -3, -1, 0, 0, 0),
+    rho2.value() * nu2_avg.value() * cp2.value() / Pr2.value()
+);
+
+Info<< "  kappa1 = " << kappa1.value() << " W/(m K)" << nl
+    << "  kappa2 = " << kappa2.value() << " W/(m K)" << endl;
 
 
 //-----------------------------------------
