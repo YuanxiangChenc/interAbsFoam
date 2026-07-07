@@ -139,7 +139,7 @@ for (int TEqnCount = 0; TEqnCount < nEnergyLoops; TEqnCount++)
       - fvm::laplacian(kappaf, T)
       + fvm::Sp(gasAnchorCoeff, T)        // implicit gas anchor (lhs)
      ==
-        Q_abs
+      - Q_abs  // check the sign!! 
       + gasAnchorCoeff * T_gas_ref_dim    // matching explicit rhs
     );
 

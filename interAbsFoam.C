@@ -202,7 +202,7 @@ forAll(mesh.cells(), celli)
     vector cc = mesh.C()[celli];
     if (mag(cc.x() - 0.038) < 0.001)  // middle column
     {
-        Info<< "y=" << cc.y() << "  c=" << c[celli] << nl;
+        Info<< "y=" << cc.y() << "  c=" << c[celli] <<"  T="<< T[celli] << nl;
     }
 }
 //--------------------------------------------------------
