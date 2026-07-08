@@ -1,4 +1,3 @@
-// UEqn.H
 // ============================================================
 // Momentum equation with variable-σ Marangoni and buoyancy.
 //
@@ -10,11 +9,11 @@
 
 MRF.correctBoundaryVelocity(U);
 
-// ------------------------------------------------------------
-// 1. Update interface normal from current alpha     // see if cEqaution can reused there paramters
-// ------------------------------------------------------------
-gradAlpha = fvc::grad(alpha1);
-nHat      = gradAlpha / (mag(gradAlpha) + deltaN);
+// cif and sigma updated here (formerly in cEqn.H).
+     // cif uses freshest cSat (call 1 of updateCSat_T, T_prev).
+     cif   = alpha1*c + (scalar(1) - alpha1)*cSat;
+     sigma = sigma0 + dsdT*(T - Tr) + dsdc*(cif - cr);
+     sigma.max(dimensionedScalar("sigMin", sigma.dimensions(), 1e-4));
 
 // ------------------------------------------------------------
 // 2. Normal surface-tension / capillary force  [Pa/m on face]
@@ -109,7 +108,7 @@ volScalarField T_liq
     alpha1*T + (scalar(1) - alpha1)*Tr
 );
 
-volVectorField gradT_liq(fvc::grad(T_liq));
+volVectorField gradT(fvc::grad(T));
 
 // note grad(cif ) move the calcuetaion of c.blending here and since c.bledning ins not longer needed in cEqn.H 
 volVectorField gradCif_v(fvc::grad(cif));
@@ -119,7 +118,7 @@ volVectorField Fsvt
 (
     IOobject("Fsvt", runTime.timeName(), mesh,
              IOobject::NO_READ, IOobject::AUTO_WRITE),
-    dsdT * (gradT_liq - nHat*(nHat & gradT_liq))
+    dsdT * (gradT - nHat*(nHat & gradT))
          * mag(gradAlpha) * scalar(2) * liquidGate
 );
 
@@ -193,3 +192,4 @@ if (runTime.writeTime())
     Fsvc.write();
     Fbuoy.write();
 }
+

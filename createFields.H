@@ -280,13 +280,6 @@ dimensionedScalar Ha
     "Ha", dimensionSet(0, 2, -2, 0, 0, 0, 0),
     readScalar(transportProperties.lookup("Ha"))
 );
-//------------------------------------------
-// Number of inner energy loops (read from PIMPLE dict or default to 1)
-label nEnergyLoops
-(
-    pimple.dict().lookupOrDefault<label>("nEnergyLoops", 1)
-);
- 
 //-------------------------------------------
 // Interface normal fields (persistent — updated in UEqn.H each step)
 //   gradAlpha : volume-of-fluid gradient [1/m]
@@ -490,6 +483,139 @@ if (p_rgh.needReference())
 
 mesh.setFluxRequired(p_rgh.name());
 mesh.setFluxRequired(alpha1.name());
+
+// ============================================================
+// createFields.H additions
+//
+// Add these blocks to createFields.H so that the interface
+// geometry fields updated by updateInterfaceGeometry.H are
+// persistent (they live between timesteps and inner iterations).
+//
+// Place these near the existing gradAlpha / nHat declarations
+// (which stay as-is — those are still cell-centred and used
+// by UEqn for Marangoni).
+// ============================================================
+
+
+// ------------------------------------------------------------
+// Sfhat — face-normal unit vector.  MESH-DEPENDENT ONLY, not
+// alpha-dependent.  Build once and never update.
+// ------------------------------------------------------------
+surfaceVectorField Sfhat
+(
+    IOobject
+    (
+        "Sfhat",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    mesh.Sf() / mesh.magSf()
+);
+
+
+// ------------------------------------------------------------
+// gradAlphaf — face-native interface gradient
+// nHatf     — face-native unit interface normal
+// nDotSf    — nHatf . Sfhat  [-]
+// Updated by updateInterfaceGeometry.H once per timestep.
+// ------------------------------------------------------------
+surfaceVectorField gradAlphaf
+(
+    IOobject
+    (
+        "gradAlphaf",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    fvc::interpolate(gradAlpha)         // gradAlpha already exists above
+);
+
+surfaceVectorField nHatf
+(
+    IOobject
+    (
+        "nHatf",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    gradAlphaf
+  / ( mag(gradAlphaf)
+    + dimensionedScalar("small", dimless/dimLength, 1e-8)
+    )
+);
+
+surfaceScalarField nDotSf
+(
+    IOobject
+    (
+        "nDotSf",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    nHatf & Sfhat
+);
+
+
+// ------------------------------------------------------------
+// isInterfaceFace — 1 where owner-neighbour alphas straddle 0.5
+// D_masked        — alpha*D1 with interface faces zeroed
+// Updated by updateInterfaceGeometry.H once per timestep.
+// ------------------------------------------------------------
+surfaceScalarField isInterfaceFace
+(
+    IOobject
+    (
+        "isInterfaceFace",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    mesh,
+    dimensionedScalar("zero", dimless, 0.0)
+);
+
+surfaceScalarField D_masked
+(
+    IOobject
+    (
+        "D_masked",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    fvc::interpolate(alpha1) * D1        // initial value
+);
+
+
+// ------------------------------------------------------------
+// Q_abs — absorption heat source [W/m3]
+// Computed each PIMPLE iteration by computeQabs.H (before TEqn),
+// independently of m_abs (which is only produced later in cEqn.H).
+// Persistent so TEqn.H and diagnostics can read it.
+// ------------------------------------------------------------
+volScalarField Q_abs
+(
+    IOobject
+    (
+        "Q_abs",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::AUTO_WRITE
+    ),
+    mesh,
+    dimensionedScalar("zero", dimEnergy/dimVolume/dimTime, 0.0)
+);
 
 #include "createMRF.H"
 #include "createFvOptions.H"

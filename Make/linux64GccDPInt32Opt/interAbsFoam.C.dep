@@ -987,11 +987,15 @@ alphaEqnSubCycle.H \
 alphaEqn.H \
 alphaSuSp.H \
 rhofs.H \
+invadec.H \
+updateInterfaceGeometry.H \
+updateCSat_T.H \
+invadec2.H \
 UEqn.H \
 pEqn.H \
-updateCSat_T.H \
+computeQabs.H \
+TEqn.H \
 cEqn.H \
 cl_cEqn.H \
-TEqn.H \
 
 #END

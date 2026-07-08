@@ -1,41 +1,12 @@
 /*---------------------------------------------------------------------------*\
-  =========                 |
-  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
-   \\    /   O peration     |
-    \\  /    A nd           | www.openfoam.com
-     \\/     M anipulation  |
--------------------------------------------------------------------------------
-    Copyright (C) 2011-2017 OpenFOAM Foundation
-    Copyright (C) 2020 OpenCFD Ltd.
--------------------------------------------------------------------------------
-License
-    This file is part of OpenFOAM.
-
-    OpenFOAM is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    OpenFOAM is distributed in the hope that it will be useful, but WITHOUT
-    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
-    FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
-    for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
-
-Application
-    interFoam
-
-Group
-    grpMultiphaseSolvers
-
-Description
-    Solver for two incompressible, isothermal immiscible fluids using a VOF
-    (volume of fluid) phase-fraction based interface capturing approach,
-    with optional mesh motion and mesh topology changes including adaptive
-    re-meshing.
-
+  interAbsFoam.C  —  main loop
+  Castro-aligned structure:
+    - alpha, invadec, interface geometry: ONCE per timestep, outside PIMPLE
+    - inner PIMPLE loop = Castro SIMPLE loop:  U -> p -> T -> c
+    - two updateCSat_T calls per inner iteration: one before UEqn (T_prev),
+      one after TEqn (T_new) — matches Castro absTCv vs absTCv2 timing
+    - inner-loop residual check driven by outerCorrectorResidualControl
+      in fvSolution (see accompanying note)
 \*---------------------------------------------------------------------------*/
 
 #include "fvCFD.H"
@@ -53,16 +24,12 @@ Description
 #include "CorrectPhi.H"
 #include "fvcSmooth.H"
 
-// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
 int main(int argc, char *argv[])
 {
     argList::addNote
     (
-        "Solver for two incompressible, isothermal immiscible fluids"
-        " using VOF phase-fraction based interface capturing.\n"
-        "With optional mesh motion and mesh topology changes including"
-        " adaptive re-meshing."
+        "Two-phase LiBr/H2O absorption solver — Castro-aligned inner loop"
     );
 
     #include "postProcess.H"
@@ -84,7 +51,6 @@ int main(int argc, char *argv[])
         #include "setInitialDeltaT.H"
     }
 
-    // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
     Info<< "\nStarting time loop\n" << endl;
 
     while (runTime.run())
@@ -106,67 +72,102 @@ int main(int argc, char *argv[])
 
         Info<< "Time = " << runTime.timeName() << nl << endl;
 
-        // --- Pressure-velocity PIMPLE corrector loop
-        while (pimple.loop())
+        // ==========================================================
+        // OUTER (per-timestep) block: alpha field, mesh, interface
+        // Runs exactly ONCE per timestep.
+        // Matches Castro's actualizaF() called after SIMPLE converges.
+        // ==========================================================
+
+        // --- Mesh update (dynamic mesh only) ---
+        if (moveMeshOuterCorrectors)
         {
-            if (pimple.firstIter() || moveMeshOuterCorrectors)
+            mesh.update();
+
+            if (mesh.changing())
             {
-                mesh.update();
-
-                if (mesh.changing())
+                if (mesh.topoChanging())
                 {
-                    // Do not apply previous time-step mesh compression flux
-                    // if the mesh topology changed
-                    if (mesh.topoChanging())
-                    {
-                        talphaPhi1Corr0.clear();
-                    }
+                    talphaPhi1Corr0.clear();
+                }
+                gh  = (g & mesh.C())  - ghRef;
+                ghf = (g & mesh.Cf()) - ghRef;
+                MRF.update();
 
-                    gh = (g & mesh.C()) - ghRef;
-                    ghf = (g & mesh.Cf()) - ghRef;
+                if (correctPhi)
+                {
+                    phi = mesh.Sf() & Uf();
+                    #include "correctPhi.H"
+                    fvc::makeRelative(phi, U);
+                    mixture.correct();
+                }
 
-                    MRF.update();
-
-                    if (correctPhi)
-                    {
-                        // Calculate absolute flux
-                        // from the mapped surface velocity
-                        phi = mesh.Sf() & Uf();
-
-                        #include "correctPhi.H"
-
-                        // Make the flux relative to the mesh motion
-                        fvc::makeRelative(phi, U);
-
-                        mixture.correct();
-                    }
-
-                    if (checkMeshCourantNo)
-                    {
-                        #include "meshCourantNo.H"
-                    }
+                if (checkMeshCourantNo)
+                {
+                    #include "meshCourantNo.H"
                 }
             }
+        }
 
-            #include "alphaControls.H"
-            #include "alphaEqnSubCycle.H"
-            #include "invadec.H" // initialize c in new-flooded cell
-            mixture.correct();
+        // --- alpha equation (once per timestep) ---
+        #include "alphaControls.H"
+        #include "alphaEqnSubCycle.H"     // also updates rho, rhoCp
+        #include "invadec.H"              // c in newly-flooded cells
+        mixture.correct();
 
+        // --- interface geometry (once per timestep) ---
+        #include "updateInterfaceGeometry.H"
+
+
+        // ==========================================================
+        // INNER (Castro SIMPLE) loop: U -> p -> T -> c
+        //
+        // pimple.loop() honours nOuterCorrectors and
+        // outerCorrectorResidualControl set in system/fvSolution:
+        //
+        //   PIMPLE
+        //   {
+        //       nOuterCorrectors 9;         // Castro ITEMAX = 9
+        //       nCorrectors      2;
+        //       nNonOrthogonalCorrectors 1;
+        //       momentumPredictor yes;
+        //
+        //       outerCorrectorResidualControl
+        //       {
+        //           U     { tolerance 1e-5; relTol 0; }
+        //           p_rgh { tolerance 1e-5; relTol 0; }
+        //           T     { tolerance 1e-5; relTol 0; }
+        //           c     { tolerance 1e-5; relTol 0; }
+        //       }
+        //   }
+        //
+        // pimple.loop() exits when EITHER all controlled residuals
+        // are below tolerance OR nOuterCorrectors is reached.
+        // This gives Castro's exit condition (all residuals < 1e-5,
+        // max 9 iterations).
+        //
+        // Note: pimple.loop() has NO built-in minimum iteration
+        // count.  To enforce ITEMIN = 5, either accept early exit
+        // (usually harmless — residuals rarely reach 1e-5 in <5
+        // iterations for this coupled system) or convert to a
+        // manual for-loop with an if-check on iterCount.
+        // ==========================================================
+        while (pimple.loop())
+        {
             if (pimple.frozenFlow())
             {
                 continue;
             }
-	    
-	    // START OF INNER PIMPLE LOOP. showd creat a inter LOOP here with 
-	    // and set up converge criterion and access to set up dt growth 
-	    // rate , max/min iterateion max/min dt ....
-	    #include "updateCSat_T.H" // calcualte the cSat (T.ant)
-	    #include "invadec2.H" // reset c to c.Sat to gas cell
-            
-            #include "UEqn.H"
 
-            // --- Pressure corrector loop
+            // --- cSat call 1: at T_prev (used by invadec2, UEqn, TEqn) ---
+            #include "updateCSat_T.H"
+
+            // --- invadec2: hard-reset c = cSat in gas-side interface cells ---
+            #include "invadec2.H"
+
+            // --- momentum ---
+            #include "UEqn.H"        // includes Marangoni + Boussinesq
+
+            // --- pressure correction (with non-ortho subcorrectors) ---
             while (pimple.correct())
             {
                 #include "pEqn.H"
@@ -176,42 +177,46 @@ int main(int argc, char *argv[])
             {
                 turbulence->correct();
             }
-	    
-	    #include "TEqn.H"
-	    #include "updateCSat_T.H"  // recalcualte cSat as T updated!
 
-	    ///////// solve c — runtime model selection ////////
-	    // blocked       = face-based  (cEqn.H)
-	    // liquidCentred = cell-based  (cl_cEqn.H)
-	    if (absorptionModel == "blocked")
-	    {
-	        #include "cEqn.H"
-	    }
-	    else // "liquidCentred"
-	    {
-	        #include "cl_cEqn.H"
-	    }
-	    ////////////////////////////////////////////////////
+            // --- absorption heat source (uses cSat from call 1, T_prev) ---
+            // Independent of m_abs — computed from c and cSat directly,
+            // matching Castro absTCv (evaluated with T_prev).
+            #include "computeQabs.H"
 
-            // #include "Output.H"
+            // --- energy ---
+            #include "TEqn.H"
 
+            // --- cSat call 2: at T_new (used by cEqn only) ---
+            #include "updateCSat_T.H"
+
+            // --- concentration (runtime model select) ---
+            if (absorptionModel == "blocked")
+            {
+                #include "cEqn.H"
+            }
+            else // "liquidCentred"
+            {
+                #include "cl_cEqn.H"
+            }
         }
+        // end of Castro inner SIMPLE loop
 
         runTime.write();
-
         runTime.printExecutionTime(Info);
     }
-//-- diagonized output ------------------------------------
-// print concentration profile along vertical line at x=l/2
-forAll(mesh.cells(), celli)
-{
-    vector cc = mesh.C()[celli];
-    if (mag(cc.x() - 0.038) < 0.001)  // middle column
+
+    // --- concentration profile along vertical line at x = l/2 ---
+    forAll(mesh.cells(), celli)
     {
-        Info<< "y=" << cc.y() << "  c=" << c[celli] <<"  T="<< T[celli] << nl;
+        vector cc = mesh.C()[celli];
+        if (mag(cc.x() - 0.038) < 0.001)
+        {
+            Info<< "y=" << cc.y()
+                << "  c=" << c[celli]
+                << "  T=" << T[celli] << nl;
+        }
     }
-}
-//--------------------------------------------------------
+
     Info<< "End\n" << endl;
 
     return 0;

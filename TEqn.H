@@ -1,69 +1,31 @@
-// TEqn.H
 // ============================================================
-// Temperature equation for the two-phase LiBr/H₂O system.
+// TEqn.H  —  Castro-aligned temperature equation
 //
-//   ρcₚ * dT/dt + ρcₚ * ∇·(U T) - ∇·(κ ∇T) = Q_abs
+//   rho*cp * dT/dt + rho*cp * div(U T) - div(kappa grad T) = Q_abs
 //
-// FIXES applied vs original:
+// Q_abs is now computed BEFORE TEqn assembly by computeQabs.H,
+// using the current c and cSat (fresh from updateCSat_T call 1,
+// T_prev — matches Castro absTCv timing).  Q_abs is a persistent
+// volScalarField (declared in createFields.H) so both TEqn.H and
+// the diagnostics can read it.
 //
-//  1. Checkerboard in gas cells:
-//     Root cause: rhoCp2 = rho2*cp2 ≈ 32 J/(m³ K) is ~110,000×
-//     smaller than rhoCp1 ≈ 3.55e6.  The off-diagonal from
-//     fvm::div(rhoCpPhi, T) at interface faces carries
-//     interp(rhoCp) ≈ rhoCp1/2 — these coefficients are
-//     ~8000× larger than the gas cell diagonal (rhoCp2*V/dt).
-//     The matrix is violently ill-conditioned in gas rows,
-//     causing checkerboard EVEN WITH Q_abs = 0.
-//
-//     Fix A — implicit gas anchor:
-//       Add fvm::Sp(gasAnchorCoeff, T) == gasAnchorCoeff*T_gas_ref
-//       in gas cells only.  gasAnchorCoeff uses rho1*cp1 (liquid
-//       thermal inertia scale), NOT rho2*cp2 — because the
-//       off-diagonal from rhoCpPhi at interface faces carries
-//       rhoCp1-scale coefficients.  An anchor based on rhoCp2
-//       is ~100,000× too weak and leaves the gas rows ill-
-//       conditioned (off-diag/diag ≈ 8000), causing checkerboard
-//       even with Q_abs = 0.  Using rhoCp1 gives off-diag/diag
-//       ≈ 0.15 — well-conditioned.
-//
-//     Fix B — hard reset after solve:
-//       For cells with alpha < alphaGasCutoff, overwrite T with
-//       T_gas_ref (a reference gas temperature read from dict or
-//       defaulting to Tr).  Mirrors the c = cSat reset in cEqn.H.
-//       T_gas_ref should be the saturation temperature of the
-//       vapour at system pressure, or simply the initial gas T.
-//
-//  2. kappaf masking:
-//     mixture.kappaf() interpolates kappa to faces using alpha.
-//     Near-interface faces between a liquid and a gas cell get
-//     kappaf ≈ 0.5*kappa1 + 0.5*kappa2 ≈ kappa1/2 — acceptable.
-//     But in pure-gas regions kappaf ≈ kappa2 ≈ 0, and combined
-//     with near-zero rhoCp2 the laplacian adds nothing to the
-//     matrix diagonal.  Use the mixture kappaf as-is (it already
-//     weights by alpha); the anchor term is the real fix.
+// This decouples Q_abs from m_abs entirely:
+//   - Q_abs  is the heat source seen by TEqn      (built from c, cSat_prev)
+//   - m_abs  is the water mass source in cEqn.H  (built from c_pre, cSat_new)
+// They are physically consistent (Q_abs = Ha * m_abs at convergence),
+// but computed independently at their respective solve points,
+// exactly as Castro does with absTCv and absTCv2.
 // ============================================================
 
 T.correctBoundaryConditions();
 
-// Face-interpolated thermal conductivity — HARMONIC MEAN, not arithmetic.
-//
+// ------------------------------------------------------------
+// Face-interpolated thermal conductivity — HARMONIC MEAN.
 // At an interface face heat conducts through both phases in series:
-//   R_total = R_liquid + R_gas
-// The effective conductivity is the harmonic mean:
-//   kappaf = 2*k1*k2 / (k1+k2)  (weighted by liquid fraction on each side)
-// 
-// For our case: k1=0.44, k2=0.018 → harmonic mean = 0.035 W/(m K)
-// vs arithmetic mean = 0.228 W/(m K) (6.5× larger — physically wrong).
-//
-// Harmonic mean:
-//   (a) Reflects the correct physics — the low-k gas side is the
-//       bottleneck for cross-interface conduction (Patankar §4).
-//   (b) Prevents heat from over-conducting into gas cells.
-//   (c) Slightly improves matrix conditioning (smaller laplacian
-//       off-diagonal at interface faces).
-//
-// Implementation: use OpenFOAM's harmonic scheme via manual construction,
-// since mixture.kappaf() default is arithmetic (linear interp of kappa).
+//   R_total = R_liquid + R_gas → effective k = 2*k1*k2/(k1+k2)
+// For our case k1=0.44, k2=0.018 → harmonic ≈ 0.035 W/(m K)
+// vs arithmetic 0.228 — the low-k gas is the bottleneck.
+// ------------------------------------------------------------
 surfaceScalarField alpha1f(fvc::interpolate(alpha1));
 surfaceScalarField kappaf
 (
@@ -74,119 +36,39 @@ surfaceScalarField kappaf
     )
 );
 
-// Read T bounds and gas reference temperature from PIMPLE dict
-scalar TMin(pimple.dict().lookupOrDefault<scalar>("TMin", 250.0));
-scalar TMax(pimple.dict().lookupOrDefault<scalar>("TMax", 400.0));
-// T_gas_ref: temperature to anchor gas cells to (K).
-// Set to initial gas temperature or vapour saturation temperature.
-scalar T_gas_ref(pimple.dict().lookupOrDefault<scalar>("T_gas_ref", Tr.value()));
-scalar alphaGasCutoff(pimple.dict().lookupOrDefault<scalar>("alphaGasCutoff", 0.01));
-
-// Absorption heat source [W/m³]:  Ha [J/kg] * m_abs [kg/(m³ s)]
-volScalarField Q_abs
-(
-    IOobject
-    (
-        "Q_abs",
-        runTime.timeName(),
-        mesh,
-        IOobject::NO_READ,
-        IOobject::AUTO_WRITE     // write for diagnosis
-    ),
-    Ha * m_abs
-);
-/// calcualteda again usde the one from (dcf) ... * 2 FF and compare with Q_abs from m_abs * Ha . and ouput in diagnoize
-
-
+// ------------------------------------------------------------
+// T bounds (read from PIMPLE dict)
+// ------------------------------------------------------------
+const scalar TMin(pimple.dict().lookupOrDefault<scalar>("TMin", 250.0));
+const scalar TMax(pimple.dict().lookupOrDefault<scalar>("TMax", 400.0));
 
 // ------------------------------------------------------------
-// Gas-cell implicit anchor coefficient  [J/(m³ K s)]
+// Temperature equation
 //
-//   BINARY gate: nonzero only in PURE GAS cells (alpha < alphaGasCutoff).
-//   Previous version used continuous alpha2 weighting, which was a bug:
-//   an interface cell with alpha=0.7 has alpha2=0.3, giving anchor
-//   coeff = 0.3 * rhoCp1/dt ≈ 1e10. That's enormous — it fights the
-//   Q_abs heat source and pulls interface cell T back to Tr, so the
-//   liquid interface never actually heats up. That's why T rises in
-//   gas (from residual leaks / anchor overshoot) but NOT in the
-//   liquid interface cells where the absorption physically happens.
+//   ddt(rhoCp T) + div(rhoCpPhi, T) - laplacian(kappaf, T) == Q_abs
 //
-//   Binary gate: pos(alphaGasCutoff - alpha1)
-//     = 1 if alpha1 < alphaGasCutoff (pure gas — anchor active)
-//     = 0 if alpha1 > alphaGasCutoff (interface + liquid — no anchor)
-//   → Q_abs freely deposits heat in interface cells
-//   → pure gas cells still get strong anchor to prevent checkerboard
+// Note: no gas-cell anchor, no post-solve T reset.  If the gas
+// cells show checkerboard, revisit those separately — first
+// verify Q_abs magnitudes are sensible from computeQabs.H output.
 // ------------------------------------------------------------
-const dimensionedScalar rhoCp1_dim("rhoCp1", dimEnergy/dimVolume/dimTemperature,
-    rho1.value()*cp1.value());
-const scalar dt_inv = 1.0 / runTime.deltaTValue();
-const dimensionedScalar alphaGasCutoff_dim("alphaGasCutoff", dimless, alphaGasCutoff);
-
-/// Re move gas anchor 
-/* 
-volScalarField gasAnchorCoeff
+fvScalarMatrix TEqn
 (
-    IOobject("gasAnchorCoeff", runTime.timeName(), mesh,
-             IOobject::NO_READ, IOobject::NO_WRITE),
-    pos(alphaGasCutoff_dim - alpha1)
-      * rhoCp1_dim
-      * dimensionedScalar("dtinv", dimless/dimTime, dt_inv)
+    fvm::ddt(rhoCp, T)
+  + fvm::div(rhoCpPhi, T)
+  - fvm::laplacian(kappaf, T)
+ ==
+    Q_abs                              // built by computeQabs.H
 );
 
-const dimensionedScalar T_gas_ref_dim("T_gas_ref", dimTemperature, T_gas_ref);
-*/
-// remove n Energy LOOPs  as T will LOOP together with PIMPLE NOW
-for (int TEqnCount = 0; TEqnCount < nEnergyLoops; TEqnCount++)
-{
-    fvScalarMatrix TEqn
-    (
-        fvm::ddt(rhoCp, T)
-      + fvm::div(rhoCpPhi, T)
-      - fvm::laplacian(kappaf, T)
-      + fvm::Sp(gasAnchorCoeff, T)        // implicit gas anchor (lhs)
-     ==
-      - Q_abs  // check the sign!! 
-      + gasAnchorCoeff * T_gas_ref_dim    // matching explicit rhs
-    );
+TEqn.relax();
+TEqn.solve();
 
-    TEqn.relax();
-    TEqn.solve();
-
-    // Hard clamp: prevents runaway in poorly initialised cells
-    forAll(T, cellI)
-    {
-        T[cellI] = max(min(T[cellI], TMax), TMin);
-    }
-
-    const scalar TMax_field = gMax(T.primitiveField());
-    const scalar TMin_field = gMin(T.primitiveField());
-    Info<< "Energy loop " << TEqnCount
-        << "  T range: (" << TMin_field << ", " << TMax_field << ")" << endl;
-}
-
-// ------------------------------------------------------------
-// Hard reset of T in pure-gas cells after solve
-//
-// Gas cells have no physical T evolution (no LiBr, no absorption
-// heat source). Resetting them to T_gas_ref:
-//   a) eliminates any residual checkerboard
-//   b) provides a consistent initial condition for the next step
-//   c) keeps the boundary condition at the gas/interface face
-//      physically meaningful for the kappaf computation
-//
-// Only applied below alphaGasCutoff (default 0.01) — not at the
-// interface itself where mixed cells carry real temperature info.
-// ------------------------------------------------------------
-// remove Tgas reset 
-/*
+// Hard clamp against runaway from bad initial conditions
 forAll(T, cellI)
 {
-    if (alpha1[cellI] < alphaGasCutoff)
-    {
-        T[cellI] = T_gas_ref;
-    }
+    T[cellI] = max(min(T[cellI], TMax), TMin);
 }
-*/
+
 fvOptions.correct(T);
 T.correctBoundaryConditions();
 
