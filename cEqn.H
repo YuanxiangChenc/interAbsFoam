@@ -13,62 +13,8 @@
 // where c_eff blends c → cSat near the interface to avoid spurious
 // Marangoni spikes from diffusion-blocked cells.
 // ============================================================
-
-alpha1.max(0.0);
-alpha1.min(1.0);
-
-// Face-interpolated cSat for gradient calculations
-surfaceScalarField cSatf(fvc::interpolate(cSat));
-
-const labelUList& own = mesh.owner();
-const labelUList& nei = mesh.neighbour();
-
 // ------------------------------------------------------------
-// 1. Interface face mask
-// ------------------------------------------------------------
-surfaceScalarField isInterfaceFace
-(
-    IOobject
-    (
-        "isInterfaceFace",
-        mesh.time().timeName(),
-        mesh,
-        IOobject::NO_READ,
-        IOobject::NO_WRITE
-    ),
-    mesh,
-    dimensionedScalar("zero", dimless, 0.0)
-);
-
-forAll(isInterfaceFace, facei)
-{
-    scalar alphaO = alpha1[own[facei]];
-    scalar alphaN = alpha1[nei[facei]];
-    if (   (alphaO > 0.5 && alphaN < 0.5)
-        || (alphaO < 0.5 && alphaN > 0.5) )
-    {
-        isInterfaceFace[facei] = 1.0;
-    }
-}
-
-// ------------------------------------------------------------
-// 2. Masked diffusivity: alpha*D1 in bulk, zero at interface faces
-// ------------------------------------------------------------
-surfaceScalarField D_masked
-(
-    IOobject
-    (
-        "D_masked",
-        mesh.time().timeName(),
-        mesh,
-        IOobject::NO_READ,
-        IOobject::NO_WRITE
-    ),
-    (scalar(1.0) - isInterfaceFace) * fvc::interpolate(alpha1) * D1
-);
-
-// ------------------------------------------------------------
-// 3. Interface normal at faces
+// 3. Interface normal at faces  -> if it already done in UEqn ? 
 // ------------------------------------------------------------
 surfaceVectorField gradAlphaf
 (
@@ -126,6 +72,7 @@ surfaceScalarField nDotSf
 // ------------------------------------------------------------
 // 4. One-sided dc/dn at interface faces  [1/m]
 //    cSat is now a volScalarField — use per-cell values
+//    Not the dc/dn used to abs is alway the differencr from local c to cSAt ! 
 // ------------------------------------------------------------
 surfaceScalarField dc_f
 (
@@ -141,7 +88,7 @@ surfaceScalarField dc_f
     dimensionedScalar("zero", dimless/dimLength, 0.0)
 );
 
-forAll(dc_f, facei)
+forAll(dc_f, facei)    //dc_f now show use local c -c.SAt ! 
 {
     if (isInterfaceFace[facei] > 0.5)
     {
@@ -152,14 +99,15 @@ forAll(dc_f, facei)
         // Use local cSat at each cell
         scalar cSatO = cSat[own[facei]];
         scalar cSatN = cSat[nei[facei]];
-
+/*   // need to update  use local c- csat ! instead of blending c.blend
         scalar cO = alphaO*c[own[facei]] + (scalar(1)-alphaO)*cSatO;
         scalar cN = alphaN*c[nei[facei]] + (scalar(1)-alphaN)*cSatN;
-
+*/       
+	//chcek if correct here? the sign!
         if (alphaO >= alphaN)
-            dc_f[facei] = max((cO - cN)/delta, scalar(0));
+            dc_f[facei] = max((cO - cSatN)/delta, scalar(0));
         else
-            dc_f[facei] = max((cN - cO)/delta, scalar(0));
+            dc_f[facei] = max((cN - cSatO)/delta, scalar(0));
     }
 }
 
@@ -220,7 +168,7 @@ Info<< "delta at iface [m]    = " << deltaMin
     << " / " << deltaMax << endl;
 
 // ------------------------------------------------------------
-// 7. Save c before solve (matrix-consistent m_abs)
+// 7. Save c before solve (matrix-consistent m_abs)  // can be removed?
 // ------------------------------------------------------------
 volScalarField c_pre
 (
@@ -259,7 +207,8 @@ cEqnM.relax();
 cEqnM.solve();
 fvOptions.correct(c);
 
-// Force c = cSat in gas cells (use local cell value)
+// Force c = cSat in gas cells (use local cell value) ---xxx gas reset removed!
+/*
 forAll(c, celli)
 {
     if (alpha1[celli] < 0.01)
@@ -268,7 +217,7 @@ forAll(c, celli)
     }
 }
 c.correctBoundaryConditions();
-
+*/
 c.max(0.0);
 c.min(1.0);
 
@@ -292,7 +241,7 @@ volScalarField m_abs_field
 
 scalarField& mabsRef = m_abs_field.primitiveFieldRef();
 
-forAll(dc_f, facei)
+forAll(dc_f, facei)   // why dc_f is recalculate again??
 {
     if (isInterfaceFace[facei] > 0.5)
     {
@@ -319,7 +268,7 @@ forAll(dc_f, facei)
         scalar cSatLiq = max(cSat[liqCell], scalar(1e-6)); // guard /0
 
         scalar jFace = (D1.value() / cSatLiq)
-                     * dcPre
+                     * dcPre                               //????
                      * mag(nDotSf[facei])
                      * mesh.magSf()[facei];
 
@@ -329,7 +278,7 @@ forAll(dc_f, facei)
 }
 
 m_abs_field.correctBoundaryConditions();
-m_abs = m_abs_field;
+m_abs = m_abs_field;  // check if ussd same function in castros code 
 
 // ------------------------------------------------------------
 // 10. Write m_abs at write times
@@ -360,7 +309,7 @@ if (runTime.writeTime())
 // ------------------------------------------------------------
 
 // Update cif with current c and cSat before sigma evaluation
-cif = alpha1*c + (scalar(1) - alpha1)*cSat;
+cif = alpha1*c + (scalar(1) - alpha1)*cSat; // removed here , only used in UEQn
 
 sigma = sigma0 + dsdT*(T - Tr) + dsdc*(cif - cr);
 
@@ -378,12 +327,13 @@ Info<< "sigma range:  " << gMin(sigma.primitiveField())
 
 // ------------------------------------------------------------
 // 12. Update rhoCp and rhoCpPhi after alpha / rho update
+// this will be calcuate ine alphaEquatnions  removed here 
 // ------------------------------------------------------------
-rhoCp = alpha1*rho1*cp1 + alpha2*rho2*cp2;
+rhoCp = alpha1*rho1*cp1 + alpha2*rho2*cp2; 
 rhoCpPhi = fvc::interpolate(rhoCp)*phi;
 
 // ------------------------------------------------------------
-// 13. Diagnostics
+// 13. Diagnostics /// cleand diagnotic
 // ------------------------------------------------------------
 surfaceScalarField magNDotSf
 (

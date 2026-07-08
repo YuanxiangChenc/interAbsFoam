@@ -11,7 +11,7 @@
 MRF.correctBoundaryVelocity(U);
 
 // ------------------------------------------------------------
-// 1. Update interface normal from current alpha
+// 1. Update interface normal from current alpha     // see if cEqaution can reused there paramters
 // ------------------------------------------------------------
 gradAlpha = fvc::grad(alpha1);
 nHat      = gradAlpha / (mag(gradAlpha) + deltaN);
@@ -89,7 +89,8 @@ volScalarField liquidGate
     pos(alpha1 - dimensionedScalar("half", dimless, 0.5))
 );
 
-// F_Marangoni = [(I-n̂n̂)·∇σ] * |∇α| * 2 * liquidGate   [N/m³]
+// F_Marangoni = [(I-n̂n̂)·∇σ] * |∇α| * 2 * liquidGate   [N/m³] 
+// modifcation : no liquida gate needed here( aling to castro code) 
 volVectorField FMarangoni
 (
     IOobject("FMarangoni", runTime.timeName(), mesh,
@@ -109,8 +110,11 @@ volScalarField T_liq
 );
 
 volVectorField gradT_liq(fvc::grad(T_liq));
+
+// note grad(cif ) move the calcuetaion of c.blending here and since c.bledning ins not longer needed in cEqn.H 
 volVectorField gradCif_v(fvc::grad(cif));
 
+// remove liquid gate and replace with FF to alignt with the Castrso code 
 volVectorField Fsvt
 (
     IOobject("Fsvt", runTime.timeName(), mesh,

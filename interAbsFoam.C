@@ -150,14 +150,20 @@ int main(int argc, char *argv[])
 
             #include "alphaControls.H"
             #include "alphaEqnSubCycle.H"
-
+            #include "invadec.H" // initialize c in new-flooded cell
             mixture.correct();
 
             if (pimple.frozenFlow())
             {
                 continue;
             }
-
+	    
+	    // START OF INNER PIMPLE LOOP. showd creat a inter LOOP here with 
+	    // and set up converge criterion and access to set up dt growth 
+	    // rate , max/min iterateion max/min dt ....
+	    #include "updateCSat_T.H" // calcualte the cSat (T.ant)
+	    #include "invadec2.H" // reset c to c.Sat to gas cell
+            
             #include "UEqn.H"
 
             // --- Pressure corrector loop
@@ -171,7 +177,8 @@ int main(int argc, char *argv[])
                 turbulence->correct();
             }
 	    
-	    #include "updateCSat_T.H"
+	    #include "TEqn.H"
+	    #include "updateCSat_T.H"  // recalcualte cSat as T updated!
 
 	    ///////// solve c — runtime model selection ////////
 	    // blocked       = face-based  (cEqn.H)
@@ -186,7 +193,6 @@ int main(int argc, char *argv[])
 	    }
 	    ////////////////////////////////////////////////////
 
-	    #include "TEqn.H"
             // #include "Output.H"
 
         }

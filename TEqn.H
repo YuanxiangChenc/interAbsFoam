@@ -95,6 +95,9 @@ volScalarField Q_abs
     ),
     Ha * m_abs
 );
+/// calcualteda again usde the one from (dcf) ... * 2 FF and compare with Q_abs from m_abs * Ha . and ouput in diagnoize
+
+
 
 // ------------------------------------------------------------
 // Gas-cell implicit anchor coefficient  [J/(m³ K s)]
@@ -119,6 +122,8 @@ const dimensionedScalar rhoCp1_dim("rhoCp1", dimEnergy/dimVolume/dimTemperature,
 const scalar dt_inv = 1.0 / runTime.deltaTValue();
 const dimensionedScalar alphaGasCutoff_dim("alphaGasCutoff", dimless, alphaGasCutoff);
 
+/// Re move gas anchor 
+/* 
 volScalarField gasAnchorCoeff
 (
     IOobject("gasAnchorCoeff", runTime.timeName(), mesh,
@@ -129,7 +134,8 @@ volScalarField gasAnchorCoeff
 );
 
 const dimensionedScalar T_gas_ref_dim("T_gas_ref", dimTemperature, T_gas_ref);
-
+*/
+// remove n Energy LOOPs  as T will LOOP together with PIMPLE NOW
 for (int TEqnCount = 0; TEqnCount < nEnergyLoops; TEqnCount++)
 {
     fvScalarMatrix TEqn
@@ -171,6 +177,8 @@ for (int TEqnCount = 0; TEqnCount < nEnergyLoops; TEqnCount++)
 // Only applied below alphaGasCutoff (default 0.01) — not at the
 // interface itself where mixed cells carry real temperature info.
 // ------------------------------------------------------------
+// remove Tgas reset 
+/*
 forAll(T, cellI)
 {
     if (alpha1[cellI] < alphaGasCutoff)
@@ -178,7 +186,7 @@ forAll(T, cellI)
         T[cellI] = T_gas_ref;
     }
 }
-
+*/
 fvOptions.correct(T);
 T.correctBoundaryConditions();
 
