@@ -1,6 +1,5 @@
 /*---------------------------------------------------------------------------*\
   interAbsFoam.C  —  main loop
-  Castro-aligned structure:
     - alpha, invadec, interface geometry: ONCE per timestep, outside PIMPLE
     - inner PIMPLE loop = Castro SIMPLE loop:  U -> p -> T -> c
     - two updateCSat_T calls per inner iteration: one before UEqn (T_prev),
@@ -180,7 +179,6 @@ int main(int argc, char *argv[])
 
             // --- absorption heat source (uses cSat from call 1, T_prev) ---
             // Independent of m_abs — computed from c and cSat directly,
-            // matching Castro absTCv (evaluated with T_prev).
             #include "computeQabs.H"
 
             // --- energy ---
@@ -199,7 +197,7 @@ int main(int argc, char *argv[])
                 #include "cl_cEqn.H"
             }
         }
-        // end of Castro inner SIMPLE loop
+        // end of inner SIMPLE loop
 
         runTime.write();
         runTime.printExecutionTime(Info);

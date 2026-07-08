@@ -10,10 +10,12 @@
 MRF.correctBoundaryVelocity(U);
 
 // cif and sigma updated here (formerly in cEqn.H).
-     // cif uses freshest cSat (call 1 of updateCSat_T, T_prev).
-     cif   = alpha1*c + (scalar(1) - alpha1)*cSat;
-     sigma = sigma0 + dsdT*(T - Tr) + dsdc*(cif - cr);
-     sigma.max(dimensionedScalar("sigMin", sigma.dimensions(), 1e-4));
+// cif uses freshest cSat (call 1 of updateCSat_T, T_prev).
+cif   = alpha1*c + (scalar(1) - alpha1)*cSat;
+cif.max(0.0);
+cif.min(1.0);            // guard against any c overshoo
+sigma = sigma0 + dsdT*(T - Tr) + dsdc*(cif - cr);
+sigma.max(dimensionedScalar("sigMin", sigma.dimensions(), 1e-4));
 
 // ------------------------------------------------------------
 // 2. Normal surface-tension / capillary force  [Pa/m on face]

@@ -1,31 +1,67 @@
-
-alpha1.max(0.0);
-alpha1.min(1.0);
-
-const labelUList& own = mesh.owner();
-const labelUList& nei = mesh.neighbour();
-
 // ============================================================
-// PRE-SOLVE A: invadec2
+// invadec2.H  —  Castro-aligned gas-cell BC for c
 //
-// Must run BEFORE cif is built so gas-side c is correct.
-//   gas cell bordering liquid → c = cSat
-//   isolated gas cell         → c = 0
+// For every cell with alpha < 0.5:
+//   - if any neighbour is liquid (alpha >= 0.5)  →  c = cSat[cell]
+//     This is the absorption Dirichlet BC seen by the c equation
+//     when its diffusion stencil crosses the interface.
+//   - otherwise (pure gas, no liquid nearby)     →  c = 0
+//     Pure gas has no LiBr.  Not resetting these leaves them
+//     susceptible to div(phi, c) advection noise, which with
+//     D_masked ≈ 0 in gas has no smoothing → checkerboarding.
+//     Castro absorcion.c lines 344-364 do exactly this reset.
+//
+// Called TWICE per PIMPLE iteration in interAbsFoam.C — once
+// after each updateCSat_T.H, so the gas BC always reflects the
+// freshest cSat.
 // ============================================================
-    scalarField hasLiquidNbr(mesh.nCells(), 0.0);
-    forAll(own, facei)
+
+{
+    const labelList& own_ic = mesh.owner();
+    const labelList& nei_ic = mesh.neighbour();
+    const cellList&  cells  = mesh.cells();
+
+    scalarField& cRef = c.primitiveFieldRef();
+    const scalarField& cSatRef = cSat.primitiveField();
+
+    forAll(alpha1, celli)
     {
-        if (alpha1[own[facei]] > 1e-3) hasLiquidNbr[nei[facei]] = 1.0;
-        if (alpha1[nei[facei]] > 1e-3) hasLiquidNbr[own[facei]] = 1.0;
-    }
-    forAll(c, celli)
-    {
-        if (alpha1[celli] < 1e-3)
+        if (alpha1[celli] < 0.01)
         {
-            c[celli] = (hasLiquidNbr[celli] > 0.5)
-                     ? cSat[celli]   // CHANGED: cSat.value() -> cSat[celli]
-                     : 0.0;
+            // Gas cell — check whether any face neighbour is liquid
+            bool hasLiquidNbr = false;
+            const labelList& cFaces = cells[celli];
+
+            forAll(cFaces, i)
+            {
+                const label facei = cFaces[i];
+                if (mesh.isInternalFace(facei))
+                {
+                    const label nbr =
+                        (own_ic[facei] == celli)
+                      ?  nei_ic[facei]
+                      :  own_ic[facei];
+
+                    if (alpha1[nbr] >= 0.01)
+                    {
+                        hasLiquidNbr = true;
+                        break;
+                    }
+                }
+            }
+
+            if (hasLiquidNbr)
+            {
+                // Interface gas cell — impose cSat Dirichlet BC
+                cRef[celli] = cSatRef[celli];
+            }
+            else
+            {
+                // Pure gas — no LiBr, kill any advection noise
+                cRef[celli] = 0.0;
+            }
         }
     }
-    c.correctBoundaryConditions();
+}
 
+c.correctBoundaryConditions();

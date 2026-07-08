@@ -2,15 +2,14 @@
 // computeQabs.H
 //
 // Compute the absorption heat source Q_abs directly from the
-// face-gradient of concentration — exactly Castro absTCv.
+// face-gradient of concentration.
 //
-// Runs BEFORE TEqn assembly.  Consumes the CURRENT c field and
-// the CURRENT cSat field.  Does NOT depend on m_abs (which is
-// only produced later, in cEqn.H).  This decouples TEqn's Q_abs
-// from cEqn's m_abs, mirroring Castro's two independent face
-// loops (absTCv sees T_prev, absTCv2 sees T_new).
+// Runs BEFORE TEqn assembly. Consumes the CURRENT c field and
+// the CURRENT cSat field. Does NOT depend on m_abs (which is
+// only produced later, in cEqn.H). This decouples TEqn's Q_abs
+// from cEqn's m_abs
 //
-// Castro absTCv (lines 583-596):
+// absTCv (lines 583-596):
 //   Qx = habs * rho1/cSat * D * (dce*NXe + dcw*NXw)/2 * 2*FF
 //   Qy = habs * rho1/cSat * D * (dcn*NYn + dcs*NYs)/2 * 2*FF
 //   Q  = (Qx + Qy)                                    [W/m3]
@@ -87,5 +86,7 @@ Q_abs = dimensionedScalar("zero", Q_abs.dimensions(), 0.0);
 
 Q_abs.correctBoundaryConditions();
 
-Info<< "Q_abs (interface heat) min/max [W/m3] = "
-    << gMin(Q_abs) << " / " << gMax(Q_abs) << endl;
+// Q_abs stats printed by TEqn.H after solve.  Bounded to >= 0
+// by the dc = max(..., 0) clamp above: each face contribution
+// is non-negative, so the accumulated Q_abs is absorption-only,
+// never desorption.
