@@ -55,12 +55,9 @@ c.min(1.0);
 // ------------------------------------------------------------
 #include "invadec2.H"
 
-// ------------------------------------------------------------
-// Accumulated mass (uses the mAbs_c value the source was built
-// from — that is the rate this iteration actually applied).
-// ------------------------------------------------------------
-const scalar dt = runTime.deltaTValue();
-Mabs_acc += mAbs_c * dt;
+// Note: Mabs_acc update happens once per timestep in
+// interAbsFoam.C after the inner loop exits (not here) so
+// multiple inner iterations don't over-count.
 
 // ------------------------------------------------------------
 // Split c min/max diagnostic (catches overshoots)
@@ -114,13 +111,5 @@ if (runTime.writeTime())
     cSource.write();
 }
 
-if ((runTime.timeIndex() % absWriteInterval) == 0)
-{
-    (*absFilePtr) << runTime.value() << " "
-                  << Mabs_acc         << " "
-                  << mAbs_T           << " "
-                  << mAbs_c           << " "
-                  << mAbs_residual_iter
-                  << nl;
-    absFilePtr->flush();
-}
+// Note: postProcessing file write happens once per timestep in
+// interAbsFoam.C after the inner loop exits — see below.
