@@ -496,6 +496,12 @@ mesh.setFluxRequired(alpha1.name());
 // by UEqn for Marangoni).
 // ============================================================
 
+const scalar gasAlphaThresh
+(
+    pimple.dict().lookupOrDefault<scalar>("gasAlphaThresh", 0.5)
+);
+
+
 
 // ------------------------------------------------------------
 // Sfhat — face-normal unit vector.  MESH-DEPENDENT ONLY, not
@@ -617,43 +623,31 @@ volScalarField Q_abs
     dimensionedScalar("zero", dimEnergy/dimVolume/dimTime, 0.0)
 );
 
+
+// ------------------------------------------------------------
+// m_abs tracking scalars for inner-loop residual.
+//
+// mAbs_T:  the m_abs value that TEqn used for its Q_abs source.
+//          Sampled after computeMabs #1 (cSat = f(T_prev)),
+//          BEFORE the T solve.
+//
+// mAbs_c:  the m_abs value that cEqn will use for its source.
+//          Sampled after computeMabs #2 (cSat = f(T_new)),
+//          BEFORE the c solve.
+//
+// Residual = |mAbs_c - mAbs_T| / max(mAbs_c, eps)
+//
+// Physical meaning: when the T-solve barely changes cSat, the
+// m_abs computed with T_prev matches the m_abs computed with
+// T_new, and the T-c coupling has converged.  
+// ------------------------------------------------------------
+scalar mAbs_T             = 0.0;
+scalar mAbs_c             = 0.0;
+scalar mAbs_residual_iter = 1.0;    // start at 1 = "not yet converged"
+ 
+
 #include "createMRF.H"
 #include "createFvOptions.H"
-
-
-
-///////////// absorption model selector ////////////////////
-// Only two production models are kept in interAbsFoam:
-//   blocked       = face-based blocked-laplacian + implicit source (cEqn.H)
-//   liquidCentred = cell-based Castro-style source + invadec       (cl_cEqn.H)
-//
-// bk_cEqn.H / rv_cEqn.H / pn_cEqn.H were exploratory variants with
-// worse performance and are not wired into this solver.
-word absorptionModel
-(
-    transportProperties.lookupOrDefault<word>
-    (
-        "absorptionModel",
-        "blocked"
-    )
-);
-
-Info<< "Absorption model: " << absorptionModel << nl
-    << "  blocked       = face-based blocked-laplacian   (cEqn.H)"    << nl
-    << "  liquidCentred = cell-based Castro src + invadec (cl_cEqn.H)" << nl
-    << endl;
-
-if
-(
-    absorptionModel != "blocked"
- && absorptionModel != "liquidCentred"
-)
-{
-    FatalErrorInFunction
-        << "Unknown absorptionModel: " << absorptionModel
-        << "\nValid options: blocked  liquidCentred"
-        << exit(FatalError);
-}
 
 ///////////// initialise Mabs accumulator & output file ////////////////////
 scalar Mabs_acc = 0.0;

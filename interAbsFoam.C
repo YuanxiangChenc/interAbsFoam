@@ -1,5 +1,6 @@
 /*---------------------------------------------------------------------------*\
   interAbsFoam.C  —  main loop
+  Castro-aligned structure:
     - alpha, invadec, interface geometry: ONCE per timestep, outside PIMPLE
     - inner PIMPLE loop = Castro SIMPLE loop:  U -> p -> T -> c
     - two updateCSat_T calls per inner iteration: one before UEqn (T_prev),
@@ -120,53 +121,52 @@ int main(int argc, char *argv[])
         // ==========================================================
         // INNER (Castro SIMPLE) loop: U -> p -> T -> c
         //
-        // pimple.loop() honours nOuterCorrectors and
-        // outerCorrectorResidualControl set in system/fvSolution:
+        // Convergence criterion:
+        //   residual = |mAbs_c - mAbs_T| / mAbs_c
+        // where
+        //   mAbs_T = m_abs sampled BEFORE T solve  (uses cSat(T_prev))
+        //   mAbs_c = m_abs sampled BEFORE c solve  (uses cSat(T_new))
         //
-        //   PIMPLE
-        //   {
-        //       nOuterCorrectors 9;         // Castro ITEMAX = 9
-        //       nCorrectors      2;
-        //       nNonOrthogonalCorrectors 1;
-        //       momentumPredictor yes;
+        // When the T solve barely changes cSat, m_abs computed with
+        // T_prev matches m_abs computed with T_new → coupling has
+        // converged.
         //
-        //       outerCorrectorResidualControl
-        //       {
-        //           U     { tolerance 1e-5; relTol 0; }
-        //           p_rgh { tolerance 1e-5; relTol 0; }
-        //           T     { tolerance 1e-5; relTol 0; }
-        //           c     { tolerance 1e-5; relTol 0; }
-        //       }
-        //   }
-        //
-        // pimple.loop() exits when EITHER all controlled residuals
-        // are below tolerance OR nOuterCorrectors is reached.
-        // This gives Castro's exit condition (all residuals < 1e-5,
-        // max 9 iterations).
-        //
-        // Note: pimple.loop() has NO built-in minimum iteration
-        // count.  To enforce ITEMIN = 5, either accept early exit
-        // (usually harmless — residuals rarely reach 1e-5 in <5
-        // iterations for this coupled system) or convert to a
-        // manual for-loop with an if-check on iterCount.
+        // Set in system/fvSolution PIMPLE dict:
+        //   nOuterCorrectors 9;             // Castro ITEMAX (default 9)
+        //   nMinInnerIter    5;             // Castro ITEMIN (default 5)
+        //   mAbsResidualTol  1e-3;          // convergence target
         // ==========================================================
+        const label  nMinInnerIter =
+            pimple.dict().lookupOrDefault<label>("nMinInnerIter", 5);
+        const scalar mAbsResTol    =
+            pimple.dict().lookupOrDefault<scalar>("mAbsResidualTol", 1e-3);
+
+        label pIter = 0;
+
         while (pimple.loop())
         {
+            ++pIter;
+
             if (pimple.frozenFlow())
             {
                 continue;
             }
 
-            // --- cSat call 1: at T_prev (used by invadec2, UEqn, TEqn) ---
-            #include "updateCSat_T.H"
+            Info<< "PIMPLE inner iteration " << pIter << endl;
 
-            // --- invadec2: hard-reset c = cSat in gas-side interface cells ---
+            // ----- cSat call 1: T_prev -----
+            #include "updateCSat_T.H"
             #include "invadec2.H"
 
-            // --- momentum ---
-            #include "UEqn.H"        // includes Marangoni + Boussinesq
+            // ----- m_abs for TEqn source (cSat(T_prev)) -----
+            #include "computeMabs.H"
+            mAbs_T = fvc::domainIntegrate(m_abs).value();
+            Info<< "mAbs_T (source for TEqn)  [kg/s] = " << mAbs_T << endl;
 
-            // --- pressure correction (with non-ortho subcorrectors) ---
+            // ----- momentum -----
+            #include "UEqn.H"
+
+            // ----- pressure correction -----
             while (pimple.correct())
             {
                 #include "pEqn.H"
@@ -177,27 +177,48 @@ int main(int argc, char *argv[])
                 turbulence->correct();
             }
 
-            // --- absorption heat source (uses cSat from call 1, T_prev) ---
-            // Independent of m_abs — computed from c and cSat directly,
-            #include "computeQabs.H"
-
-            // --- energy ---
+            // ----- energy: uses Q_abs = Ha * m_abs (m_abs = mAbs_T-consistent) -----
             #include "TEqn.H"
 
-            // --- cSat call 2: at T_new (used by cEqn only) ---
+            // ----- cSat call 2: T_new -----
             #include "updateCSat_T.H"
+            #include "invadec2.H"
 
-            // --- concentration (runtime model select) ---
-            if (absorptionModel == "blocked")
+            // ----- m_abs for cEqn source (cSat(T_new)) -----
+            #include "computeMabs.H"
+            mAbs_c = fvc::domainIntegrate(m_abs).value();
+            Info<< "mAbs_c (source for cEqn)  [kg/s] = " << mAbs_c << endl;
+
+            // ----- inner-loop residual: how much T-solve changed m_abs -----
+            mAbs_residual_iter =
+                mag(mAbs_c - mAbs_T)
+              / max(mag(mAbs_c), scalar(1e-20));
+
+            // ----- concentration (uses m_abs = mAbs_c-consistent as source) -----
+            
+            #include "cEqn.H"
+            // ----- Report + early exit on m_abs convergence -----
+            Info<< "----------------------------------------------------" << nl
+                << "PIMPLE iter " << pIter << " summary:" << nl
+                << "  mAbs_T (T-source)   [kg/s] = " << mAbs_T << nl
+                << "  mAbs_c (c-source)   [kg/s] = " << mAbs_c << nl
+                << "  m_abs residual             = "
+                << mAbs_residual_iter
+                << "   (tol = " << mAbsResTol
+                << ", min iter = " << nMinInnerIter << ")" << nl
+                << "----------------------------------------------------" << endl;
+
+            if
+            (
+                pIter >= nMinInnerIter
+             && mAbs_residual_iter < mAbsResTol
+            )
             {
-                #include "cEqn.H"
-            }
-            else // "liquidCentred"
-            {
-                #include "cl_cEqn.H"
+                Info<< "==> Inner loop converged on m_abs after "
+                    << pIter << " iterations" << nl << endl;
+                break;
             }
         }
-        // end of inner SIMPLE loop
 
         runTime.write();
         runTime.printExecutionTime(Info);

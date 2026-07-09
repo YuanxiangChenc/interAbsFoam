@@ -1,0 +1,2805 @@
+
+--- START OF FILE: cEqn.H ---
+// ============================================================
+// cEqn.H  —  face-based ("blocked") LiBr concentration equation
+// Castro-aligned form; runs INSIDE the PIMPLE inner loop.
+//
+// Interface geometry is pre-computed once per timestep by
+// updateInterfaceGeometry.H before the inner loop starts.
+// This file consumes those persistent fields:
+//   isInterfaceFace, D_masked, nDotSf, nHatf
+// and does not recompute them.
+//
+// cSat is updated by the second updateCSat_T.H call immediately
+// before this file (uses T_new, matching Castro absTCv2).
+// ============================================================
+
+alpha1.max(0.0);
+alpha1.min(1.0);
+
+const labelUList& own = mesh.owner();
+const labelUList& nei = mesh.neighbour();
+
+// ------------------------------------------------------------
+// 1. One-sided dc/dn at interface faces  [1/m]
+//
+//    Castro absTCv2 (pure form, no cif blend):
+//      alphaO > alphaN  → owner liquid, neighbour gas
+//        dc = (c[own] - cSat[nei]) / delta
+//      alphaO < alphaN  → neighbour liquid, owner gas
+//        dc = (c[nei] - cSat[own]) / delta
+//
+//    Clamped >= 0 to reject spurious desorption from numerical
+//    noise in near-equilibrium cells.
+// ------------------------------------------------------------
+surfaceScalarField dc_f
+(
+    IOobject
+    (
+        "dc_f",
+        mesh.time().timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    mesh,
+    dimensionedScalar("zero", dimless/dimLength, 0.0)
+);
+
+forAll(dc_f, facei)
+{
+    if (isInterfaceFace[facei] > 0.5)
+    {
+        scalar alphaO = alpha1[own[facei]];
+        scalar alphaN = alpha1[nei[facei]];
+        scalar delta  = 1.0 / mesh.deltaCoeffs()[facei];
+
+        scalar dc;
+        if (alphaO > alphaN)
+        {
+            dc = (c[own[facei]] - cSat[nei[facei]]) / delta;
+        }
+        else
+        {
+            dc = (c[nei[facei]] - cSat[own[facei]]) / delta;
+        }
+        dc_f[facei] = max(dc, scalar(0));
+    }
+}
+
+// ------------------------------------------------------------
+// 2. Implicit diagonal and per-cell RHS field
+//
+//    Castro absTCv2 discrete source per liquid cell:
+//      S[i] = -D/delta * (c[i] - cSat_gas) * |nDotSf| * Sf / V
+//
+//    Split into implicit LHS + RHS:
+//      + fvm::Sp(coeffImpl, c)                  (diagonal)
+//      == coeffImpl_B                           (RHS)
+//    where
+//      coeffImpl   = D/delta * |nDotSf| * Sf / V           [1/s]
+//      coeffImpl_B = D/delta * cSat_gas * |nDotSf| * Sf / V [1/s]
+//
+//    Net source in liquid cell:
+//      coeffImpl_B - coeffImpl*c
+//    = D/delta * (cSat_gas - c) * |nDotSf| * Sf / V
+//    < 0 when c > cSat_gas  → absorption (drives c down).
+// ------------------------------------------------------------
+volScalarField coeffImpl
+(
+    IOobject
+    (
+        "coeffImpl",
+        mesh.time().timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    mesh,
+    dimensionedScalar("zero", dimless/dimTime, 0.0)
+);
+
+// Liquid-side threshold for depositing the source.
+// Independent of gasAlphaThresh — cells with alpha > liqAlphaThresh
+// receive the absorption source term.  Default 0.5 keeps the
+// classical "majority liquid" definition; can be tightened
+// (e.g. 0.9) to concentrate source deposition in bulk-liquid
+// cells only, or loosened (e.g. 0.1) for broader distribution.
+const scalar liqAlphaThresh
+(
+    pimple.dict().lookupOrDefault<scalar>("liqAlphaThresh", 0.5)
+);
+
+coeffImpl.primitiveFieldRef() =
+    fvc::surfaceSum
+    (
+        isInterfaceFace
+      * D1
+      * mesh.deltaCoeffs()
+      * mag(nDotSf)
+      * mesh.magSf()
+    )().primitiveField()
+  / mesh.V().field();
+
+coeffImpl.correctBoundaryConditions();
+coeffImpl *=
+    pos(alpha1 - dimensionedScalar("liqThr", dimless, liqAlphaThresh));
+
+// RHS field: face loop accumulating cSat_gas into the liquid cell
+volScalarField coeffImpl_B
+(
+    IOobject
+    (
+        "coeffImpl_B",
+        mesh.time().timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    mesh,
+    dimensionedScalar("zero", dimless/dimTime, 0.0)
+);
+
+{
+    scalarField& bRef = coeffImpl_B.primitiveFieldRef();
+
+    forAll(isInterfaceFace, facei)
+    {
+        if (isInterfaceFace[facei] > 0.5)
+        {
+            scalar faceCoeff =
+                D1.value()
+              * mesh.deltaCoeffs()[facei]
+              * mag(nDotSf[facei])
+              * mesh.magSf()[facei];
+
+            if (alpha1[own[facei]] > alpha1[nei[facei]])
+            {
+                // owner = liquid, neighbour = gas
+                bRef[own[facei]] +=
+                    faceCoeff * cSat[nei[facei]] / mesh.V()[own[facei]];
+            }
+            else
+            {
+                // neighbour = liquid, owner = gas
+                bRef[nei[facei]] +=
+                    faceCoeff * cSat[own[facei]] / mesh.V()[nei[facei]];
+            }
+        }
+    }
+}
+
+coeffImpl_B.correctBoundaryConditions();
+coeffImpl_B *=
+    pos(alpha1 - dimensionedScalar("liqThr", dimless, liqAlphaThresh));
+
+// ------------------------------------------------------------
+// 3. m_abs from matrix coefficients — computed BEFORE solve
+//
+//    Per liquid cell, the net absorption source added to the c
+//    equation is:
+//
+//      S_c[i] = coeffImpl_B[i] - coeffImpl[i] * c[i]     [1/s]
+//             = D/delta * (cSat_gas - c[i]) * |nDotSf| * Sf / V
+//
+//    This is the LiBr mass-fraction rate-of-change per cell due
+//    to absorption.  Converting to water-mass-rate:
+//
+//      m_abs[i] = -rho1 * S_c[i] / cSat[i]                [kg/m3/s]
+//               =  rho1 * (coeffImpl*c - coeffImpl_B) / cSat[i]
+//
+//    Sign: c > cSat → S_c < 0 (LiBr fraction decreases as water
+//    is absorbed) → m_abs > 0 (positive water absorption rate).
+//
+//    Consistent with Castro absTCv2:
+//      mx = D * (c_bulk - cSat) / delta * N   (his direct grad form)
+//    which equals -S_c/(|nDotSf|*Sf/V) at the face level.
+//
+//    Computed here (before solve) using the PRE-SOLVE c field,
+//    exactly as Castro's absTCv2 does at matrix-assembly time.
+//    No post-solve face loop needed.
+// ------------------------------------------------------------
+{
+    volScalarField sourceRate
+    (
+        "sourceRate",
+        coeffImpl * c - coeffImpl_B      // [1/s], = -S_c
+    );
+
+    // m_abs = rho1 * sourceRate / cSat   [kg/m3/s]
+    // Use cSat as denominator (per Castro line 638: mass fraction
+    // → water mass conversion factor 1/cSat).  Guard against
+    // cSat = 0 in pure gas cells (source is zero there anyway).
+    m_abs = rho1
+          * sourceRate
+          / max(cSat, dimensionedScalar("cSatFloor", cSat.dimensions(), 1e-6));
+
+    // m_abs is only meaningful in liquid cells (source is masked
+    // to zero elsewhere by liquidGate on coeffImpl / coeffImpl_B),
+    // but zero out any residual to be explicit.
+    m_abs *=
+        pos(alpha1 - dimensionedScalar("liqThr", dimless, liqAlphaThresh));
+}
+
+if (runTime.writeTime())
+{
+    m_abs.write();
+}
+
+// ------------------------------------------------------------
+// 4. Concentration equation
+//
+//    ddt(c) + div(u,c) - laplacian(D_masked,c)
+//    + fvm::Sp(coeffImpl, c) == coeffImpl_B
+//
+//    Interface diffusion is REPLACED by the coeffImpl / coeffImpl_B
+//    absorption pair — D_masked is zero on interface faces.
+// ------------------------------------------------------------
+fvScalarMatrix cEqnM
+(
+    fvm::ddt(c)
+  + fvm::div(phi, c)
+  - fvm::laplacian(D_masked, c)
+  + fvm::Sp(coeffImpl, c)
+ ==
+    coeffImpl_B
+);
+
+fvOptions.constrain(cEqnM);
+cEqnM.relax();
+cEqnM.solve();
+fvOptions.correct(c);
+
+c.max(0.0);
+c.min(1.0);
+
+// ------------------------------------------------------------
+// Post-solve gas-cell reset — Castro-faithful.
+// Castro's gas cells have identity rows (a_p=1, b=c[i,j]) so
+// their c value never changes during the solve.  Here the solve
+// touches gas cells (through div(phi,c) with no diffusive
+// smoothing since D_masked~0), which can push them out of
+// range and get clamped.  Reset them immediately using the
+// same invadec2 logic that runs at the top of the loop.
+// ------------------------------------------------------------
+#include "invadec2.H"
+
+// ------------------------------------------------------------
+// 5. Diagnostics — split by phase to catch overshoots
+//
+//   Liquid stats: physically c should stay between ~cSat and
+//   c_init (0.5522 for the Castro pool case).  If c_liq_max > 0.6
+//   or c_liq_min < 0.35, look for solve instability.
+//
+//   Gas stats: after the reset above, c_gas should be 0 (pure gas)
+//   or cSat (~0.41) at interface gas cells.  If c_gas_max > cSat
+//   the reset didn't run — check invadec2/reset code path.
+//
+//   m_abs_from_c should match m_abs_from_Q (printed by TEqn.H).
+// ------------------------------------------------------------
+scalar cLiqMin =  GREAT;
+scalar cLiqMax = -GREAT;
+scalar cGasMin =  GREAT;
+scalar cGasMax = -GREAT;
+label  nLiq = 0;
+label  nGas = 0;
+
+const scalar diagThresh
+(
+    pimple.dict().lookupOrDefault<scalar>("gasAlphaThresh", 0.5)
+);
+
+forAll(c, celli)
+{
+    if (alpha1[celli] >= diagThresh)
+    {
+        cLiqMin = min(cLiqMin, c[celli]);
+        cLiqMax = max(cLiqMax, c[celli]);
+        ++nLiq;
+    }
+    else
+    {
+        cGasMin = min(cGasMin, c[celli]);
+        cGasMax = max(cGasMax, c[celli]);
+        ++nGas;
+    }
+}
+reduce(cLiqMin, minOp<scalar>());
+reduce(cLiqMax, maxOp<scalar>());
+reduce(cGasMin, minOp<scalar>());
+reduce(cGasMax, maxOp<scalar>());
+reduce(nLiq,    sumOp<label>());
+reduce(nGas,    sumOp<label>());
+
+const scalar domainVol = gSum(mesh.V().field());
+const scalar lx        = 0.076;
+const scalar ly        = 0.020;
+const scalar dz        = domainVol / (lx * ly);
+
+const scalar dt        = runTime.deltaTValue();
+const scalar mAbsFromC = fvc::domainIntegrate(m_abs).value();
+Mabs_acc += mAbsFromC * dt;
+
+Info<< "c liquid min/max [-]    = "
+    << cLiqMin << " / " << cLiqMax
+    << "   (n = " << nLiq << ")" << endl;
+Info<< "c gas    min/max [-]    = "
+    << cGasMin << " / " << cGasMax
+    << "   (n = " << nGas << ")" << endl;
+Info<< "c - cSat liq min/max [-]= "
+    << min(c - cSat).value()
+    << " / " << max(c - cSat).value() << endl;
+Info<< "m_abs_from_c    [kg/s]  = " << mAbsFromC << endl;
+Info<< "m_abs/dz        [kg/m/s]= " << mAbsFromC / dz << endl;
+Info<< "Mabs_acc        [kg]    = " << Mabs_acc << endl;
+Info<< "Mabs_acc/dz     [kg/m]  = " << Mabs_acc / dz << endl;
+
+if ((runTime.timeIndex() % absWriteInterval) == 0)
+{
+    (*absFilePtr) << runTime.value() << " "
+                  << Mabs_acc        << " "
+                  << Mabs_acc / dz
+                  << nl;
+    absFilePtr->flush();
+}
+
+--- END OF FILE: cEqn.H ---
+
+--- START OF FILE: alphaEqnSubCycle.H ---
+if (nAlphaSubCycles > 1)
+{
+    dimensionedScalar totalDeltaT = runTime.deltaT();
+    surfaceScalarField rhoPhiSum
+    (
+        IOobject
+        (
+            "rhoPhiSum",
+            runTime.timeName(),
+            mesh
+        ),
+        mesh,
+        dimensionedScalar(rhoPhi.dimensions(), Zero)
+    );
+
+    tmp<volScalarField> trSubDeltaT;
+
+    if (LTS)
+    {
+        trSubDeltaT =
+            fv::localEulerDdt::localRSubDeltaT(mesh, nAlphaSubCycles);
+    }
+
+    for
+    (
+        subCycle<volScalarField> alphaSubCycle(alpha1, nAlphaSubCycles);
+        !(++alphaSubCycle).end();
+    )
+    {
+        #include "alphaEqn.H"
+        rhoPhiSum += (runTime.deltaT()/totalDeltaT)*rhoPhi;
+    }
+
+    rhoPhi = rhoPhiSum;
+}
+else
+{
+    #include "alphaEqn.H"
+}
+
+rho == alpha1*rho1 + alpha2*rho2;
+// update rhoCp
+rhoCp = alpha1 * rho1 * cp1 + alpha2 * rho2 * cp2;
+
+
+--- END OF FILE: alphaEqnSubCycle.H ---
+
+--- START OF FILE: pEqn.H ---
+{
+    if (correctPhi)
+    {
+        rAU.ref() = 1.0/UEqn.A();
+    }
+    else
+    {
+        rAU = 1.0/UEqn.A();
+    }
+
+    surfaceScalarField rAUf("rAUf", fvc::interpolate(rAU()));
+    volVectorField HbyA(constrainHbyA(rAU()*UEqn.H(), U, p_rgh));
+    surfaceScalarField phiHbyA
+    (
+        "phiHbyA",
+        fvc::flux(HbyA)
+      + MRF.zeroFilter(fvc::interpolate(rho*rAU())*fvc::ddtCorr(U, phi, Uf))
+    );
+    MRF.makeRelative(phiHbyA);
+
+    if (p_rgh.needReference())
+    {
+        fvc::makeRelative(phiHbyA, U);
+        adjustPhi(phiHbyA, U, p_rgh);
+        fvc::makeAbsolute(phiHbyA, U);
+    }
+
+    surfaceScalarField phig
+    (
+        (
+            mixture.surfaceTensionForce()
+          - ghf*fvc::snGrad(rho)
+        )*rAUf*mesh.magSf()
+    );
+
+    phiHbyA += phig;
+
+    // Update the pressure BCs to ensure flux consistency
+    constrainPressure(p_rgh, U, phiHbyA, rAUf, MRF);
+
+    while (pimple.correctNonOrthogonal())
+    {
+        fvScalarMatrix p_rghEqn
+        (
+            fvm::laplacian(rAUf, p_rgh) == fvc::div(phiHbyA)
+        );
+
+        p_rghEqn.setReference(pRefCell, getRefCellValue(p_rgh, pRefCell));
+
+        p_rghEqn.solve(mesh.solver(p_rgh.select(pimple.finalInnerIter())));
+
+        if (pimple.finalNonOrthogonalIter())
+        {
+            phi = phiHbyA - p_rghEqn.flux();
+
+            p_rgh.relax();
+
+            U = HbyA + rAU()*fvc::reconstruct((phig - p_rghEqn.flux())/rAUf);
+            U.correctBoundaryConditions();
+            fvOptions.correct(U);
+        }
+    }
+
+    #include "continuityErrs.H"
+
+    // Correct Uf if the mesh is moving
+    fvc::correctUf(Uf, U, phi);
+
+    // Make the fluxes relative to the mesh motion
+    fvc::makeRelative(phi, U);
+
+    p == p_rgh + rho*gh;
+
+    if (p_rgh.needReference())
+    {
+        p += dimensionedScalar
+        (
+            "p",
+            p.dimensions(),
+            pRefValue - getRefCellValue(p, pRefCell)
+        );
+        p_rgh = p - rho*gh;
+    }
+
+    if (!correctPhi)
+    {
+        rAU.clear();
+    }
+}
+
+--- END OF FILE: pEqn.H ---
+
+--- START OF FILE: .gitignore ---
+Make/ln***
+
+--- END OF FILE: .gitignore ---
+
+--- START OF FILE: setRDeltaT.H ---
+{
+    volScalarField& rDeltaT = trDeltaT.ref();
+
+    const dictionary& pimpleDict = pimple.dict();
+
+    scalar maxCo
+    (
+        pimpleDict.getOrDefault<scalar>("maxCo", 0.9)
+    );
+
+    scalar maxAlphaCo
+    (
+        pimpleDict.getOrDefault<scalar>("maxAlphaCo", 0.2)
+    );
+
+    scalar rDeltaTSmoothingCoeff
+    (
+        pimpleDict.getOrDefault<scalar>("rDeltaTSmoothingCoeff", 0.1)
+    );
+
+    label nAlphaSpreadIter
+    (
+        pimpleDict.getOrDefault<label>("nAlphaSpreadIter", 1)
+    );
+
+    scalar alphaSpreadDiff
+    (
+        pimpleDict.getOrDefault<scalar>("alphaSpreadDiff", 0.2)
+    );
+
+    scalar alphaSpreadMax
+    (
+        pimpleDict.getOrDefault<scalar>("alphaSpreadMax", 0.99)
+    );
+
+    scalar alphaSpreadMin
+    (
+        pimpleDict.getOrDefault<scalar>("alphaSpreadMin", 0.01)
+    );
+
+    label nAlphaSweepIter
+    (
+        pimpleDict.getOrDefault<label>("nAlphaSweepIter", 5)
+    );
+
+    scalar rDeltaTDampingCoeff
+    (
+        pimpleDict.getOrDefault<scalar>("rDeltaTDampingCoeff", 1.0)
+    );
+
+    scalar maxDeltaT
+    (
+        pimpleDict.getOrDefault<scalar>("maxDeltaT", GREAT)
+    );
+
+    volScalarField rDeltaT0("rDeltaT0", rDeltaT);
+
+    // Set the reciprocal time-step from the local Courant number
+    rDeltaT.ref() = max
+    (
+        1/dimensionedScalar("maxDeltaT", dimTime, maxDeltaT),
+        fvc::surfaceSum(mag(rhoPhi))()()
+       /((2*maxCo)*mesh.V()*rho())
+    );
+
+    if (maxAlphaCo < maxCo)
+    {
+        // Further limit the reciprocal time-step
+        // in the vicinity of the interface
+
+        volScalarField alpha1Bar(fvc::average(alpha1));
+
+        rDeltaT.ref() = max
+        (
+            rDeltaT(),
+            pos0(alpha1Bar() - alphaSpreadMin)
+           *pos0(alphaSpreadMax - alpha1Bar())
+           *fvc::surfaceSum(mag(phi))()()
+           /((2*maxAlphaCo)*mesh.V())
+        );
+    }
+
+    // Update tho boundary values of the reciprocal time-step
+    rDeltaT.correctBoundaryConditions();
+
+    Info<< "Flow time scale min/max = "
+        << gMin(1/rDeltaT.primitiveField())
+        << ", " << gMax(1/rDeltaT.primitiveField()) << endl;
+
+    if (rDeltaTSmoothingCoeff < 1.0)
+    {
+        fvc::smooth(rDeltaT, rDeltaTSmoothingCoeff);
+    }
+
+    if (nAlphaSpreadIter > 0)
+    {
+        fvc::spread
+        (
+            rDeltaT,
+            alpha1,
+            nAlphaSpreadIter,
+            alphaSpreadDiff,
+            alphaSpreadMax,
+            alphaSpreadMin
+        );
+    }
+
+    if (nAlphaSweepIter > 0)
+    {
+        fvc::sweep(rDeltaT, alpha1, nAlphaSweepIter, alphaSpreadDiff);
+    }
+
+    Info<< "Smoothed flow time scale min/max = "
+        << gMin(1/rDeltaT.primitiveField())
+        << ", " << gMax(1/rDeltaT.primitiveField()) << endl;
+
+    // Limit rate of change of time scale
+    // - reduce as much as required
+    // - only increase at a fraction of old time scale
+    if
+    (
+        rDeltaTDampingCoeff < 1.0
+     && runTime.timeIndex() > runTime.startTimeIndex() + 1
+    )
+    {
+        rDeltaT = max
+        (
+            rDeltaT,
+            (scalar(1) - rDeltaTDampingCoeff)*rDeltaT0
+        );
+
+        Info<< "Damped flow time scale min/max = "
+            << gMin(1/rDeltaT.primitiveField())
+            << ", " << gMax(1/rDeltaT.primitiveField()) << endl;
+    }
+}
+
+--- END OF FILE: setRDeltaT.H ---
+
+--- START OF FILE: updateInterfaceGeometry.H ---
+// ============================================================
+// updateInterfaceGeometry.H
+//
+// Update all interface-normal / interface-mask fields ONCE per
+// timestep, right after the alpha equation and invadec.  These
+// fields are then frozen for the entire inner PIMPLE loop —
+// UEqn.H, cEqn.H, and TEqn.H all read them without recomputing.
+//
+// Fields updated (all declared as persistent in createFields.H):
+//   gradAlpha        [1/m]   volVectorField    — for UEqn Marangoni
+//   nHat             [-]     volVectorField    — for UEqn Marangoni
+//   gradAlphaf       [1/m]   surfaceVectorField — for cEqn flux
+//   nHatf            [-]     surfaceVectorField — for cEqn flux
+//   nDotSf           [m2]    surfaceScalarField — for cEqn coeff
+//   isInterfaceFace  [-]     surfaceScalarField — for cEqn mask
+//   D_masked         [m2/s]  surfaceScalarField — for cEqn laplacian
+//
+// Not updated here (constant throughout run):
+//   Sfhat            [-]     surfaceVectorField — mesh.Sf()/mesh.magSf()
+//                                                   (built once in createFields.H)
+// ============================================================
+
+const labelUList& own_ = mesh.owner();
+const labelUList& nei_ = mesh.neighbour();
+
+// --- Volumetric interface normal (cell-centred) ---
+gradAlpha = fvc::grad(alpha1);
+nHat      = gradAlpha / (mag(gradAlpha) + deltaN);
+
+// --- Face-native interface normal ---
+gradAlphaf = fvc::interpolate(gradAlpha);
+nHatf      = gradAlphaf
+           / ( mag(gradAlphaf)
+             + dimensionedScalar("small", dimless/dimLength, 1e-8)
+             );
+
+nDotSf = nHatf & Sfhat;
+
+// --- Interface face mask (owner-neighbour crosses 0.5) ---
+forAll(isInterfaceFace, facei)
+{
+    scalar aO = alpha1[own_[facei]];
+    scalar aN = alpha1[nei_[facei]];
+    isInterfaceFace[facei] =
+        (   (aO > 0.5 && aN < 0.5)
+         || (aO < 0.5 && aN > 0.5) )
+        ? 1.0 : 0.0;
+}
+isInterfaceFace.correctBoundaryConditions();
+
+// --- Masked diffusivity: alpha*D1 in bulk, zero on interface faces ---
+D_masked =
+    (scalar(1.0) - isInterfaceFace)
+  * fvc::interpolate(alpha1)
+  * D1;
+
+Info<< "Interface geometry updated  |  nInterface faces = "
+    << gSum(isInterfaceFace.primitiveField()) << endl;
+
+--- END OF FILE: updateInterfaceGeometry.H ---
+
+--- START OF FILE: rhofs.H ---
+const dimensionedScalar& rho1f(rho1);
+const dimensionedScalar& rho2f(rho2);
+
+--- END OF FILE: rhofs.H ---
+
+--- START OF FILE: createFields.H ---
+#include "createRDeltaT.H"
+
+//----------------- ADD IO dict -----------------
+IOdictionary transportProperties
+(
+    IOobject
+    (
+        "transportProperties",
+        runTime.constant(),
+        mesh,
+        IOobject::MUST_READ,
+        IOobject::NO_WRITE
+    )
+);
+//-------------------------------------------------
+
+Info<< "Reading field p_rgh\n" << endl;
+volScalarField p_rgh
+(
+    IOobject
+    (
+        "p_rgh",
+        runTime.timeName(),
+        mesh,
+        IOobject::MUST_READ,
+        IOobject::AUTO_WRITE
+    ),
+    mesh
+);
+
+Info<< "Reading field U\n" << endl;
+volVectorField U
+(
+    IOobject
+    (
+        "U",
+        runTime.timeName(),
+        mesh,
+        IOobject::MUST_READ,
+        IOobject::AUTO_WRITE
+    ),
+    mesh
+);
+
+
+//----------------------------------------
+// Concetration field
+//----------------------------------------
+Info<< "Reading field c\n" << endl;
+volScalarField c
+(
+    IOobject
+    (
+        "c",
+        runTime.timeName(),
+        mesh,
+        IOobject::MUST_READ,
+        IOobject::AUTO_WRITE
+    ),
+    mesh
+);
+
+Info << "Creating field cif\n" << endl;
+volScalarField cif
+(
+    IOobject
+    (
+        "cif",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE    // written explicitly by rv_cEqn/pn_cEqn only
+    ),
+    mesh,
+    dimensionedScalar("zero", dimless, 0.0)
+);
+
+//----------------------------------------
+// Temperature field
+//----------------------------------------
+Info<< "Reading field T\n" << endl;
+volScalarField T
+(
+    IOobject
+    (
+        "T",
+        runTime.timeName(),
+        mesh,
+        IOobject::MUST_READ,
+        IOobject::AUTO_WRITE
+    ),
+    mesh
+);
+//--------------------------------------------
+
+#include "createPhi.H"
+
+
+Info<< "Reading transportProperties\n" << endl;
+immiscibleIncompressibleTwoPhaseMixture mixture(U, phi, T, c);
+
+volScalarField& alpha1(mixture.alpha1());
+volScalarField& alpha2(mixture.alpha2());
+
+const dimensionedScalar& rho1 = mixture.rho1();
+const dimensionedScalar& rho2 = mixture.rho2();
+const dimensionedScalar& D1 = mixture.D1();
+const dimensionedScalar& D2 = mixture.D2();
+const dimensionedScalar& cp1 = mixture.cp1();
+const dimensionedScalar& cp2 = mixture.cp2();
+const dimensionedScalar& Pr1 = mixture.Pr1();
+const dimensionedScalar& Pr2 = mixture.Pr2();
+
+// Thermal conductivity kappa is NOT stored directly in the mixture
+// class (there is no mixture.kappa1() accessor). Derive it from
+// the definition of the Prandtl number:
+//
+//   Pr = mu * cp / kappa   →   kappa = mu * cp / Pr = rho * nu * cp / Pr
+//
+// nuModel->nu() returns a volScalarField (spatially varying because
+// viscosity models like Arrhenius depend on T). For Newtonian phases
+// nu is uniform, so we take the domain average to reduce it to a
+// scalar for TEqn.H's face-field construction below.
+//
+// If a spatially varying kappa is ever needed, build kappa1_field
+// and kappa2_field as volScalarFields directly using nuModel->nu().
+Info<< "Deriving kappa1, kappa2 from rho * nu * cp / Pr\n" << endl;
+
+const dimensionedScalar nu1_avg
+(
+    "nu1_avg",
+    dimensionSet(0, 2, -1, 0, 0, 0, 0),
+    gAverage(mixture.nuModel1().nu()())
+);
+const dimensionedScalar nu2_avg
+(
+    "nu2_avg",
+    dimensionSet(0, 2, -1, 0, 0, 0, 0),
+    gAverage(mixture.nuModel2().nu()())
+);
+
+const dimensionedScalar kappa1
+(
+    "kappa1",
+    dimensionSet(1, 1, -3, -1, 0, 0, 0),
+    rho1.value() * nu1_avg.value() * cp1.value() / Pr1.value()
+);
+const dimensionedScalar kappa2
+(
+    "kappa2",
+    dimensionSet(1, 1, -3, -1, 0, 0, 0),
+    rho2.value() * nu2_avg.value() * cp2.value() / Pr2.value()
+);
+
+Info<< "  kappa1 = " << kappa1.value() << " W/(m K)" << nl
+    << "  kappa2 = " << kappa2.value() << " W/(m K)" << endl;
+
+
+//-----------------------------------------
+Info << "Reading D, cSat from transportProperties\n" << endl;
+dimensionedScalar cSat0("cSat0", dimensionSet(0, 0, 0, 0, 0, 0, 0), readScalar(transportProperties.lookup("cSat0")));
+
+// ---- cSat as volScalarField (updated each step by updateCSat_T.H) ----------
+Info<< "Creating volScalarField cSat\n" << endl;
+volScalarField cSat
+(
+    IOobject
+    (
+        "cSat",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::AUTO_WRITE
+    ),
+    mesh,
+    cSat0          // uniform initialisation from transportProperties
+);
+ 
+//-------------------------------------------
+// Surface tension
+//   sigma0   : reference value read from transportProperties (same key "sigma"
+//              that immiscibleIncompressibleTwoPhaseMixture already uses)
+//   sigma    : volScalarField updated in cEqn.H via Marangoni law
+//              sigma = sigma0 + dsdT*(T - Tr) + dsdc*(c_eff - cr)
+//-------------------------------------------
+Info<< "Reading Marangoni / surface-tension parameters\n" << endl;
+ 
+dimensionedScalar sigma0
+(
+    "sigma0", dimensionSet(1, 0, -2, 0, 0, 0, 0),
+    readScalar(transportProperties.lookup("sigma0"))
+);
+ 
+// dσ/dT  [N/(m K)]  — typically negative for aqueous solutions
+dimensionedScalar dsdT
+(
+    "dsdT", dimensionSet(1, 0, -2, -1, 0, 0, 0),
+    readScalar(transportProperties.lookup("dsdT"))
+);
+ 
+// dσ/dc  [N/m per unit mass fraction]
+dimensionedScalar dsdc
+(
+    "dsdc", dimensionSet(1, 0, -2, 0, 0, 0, 0),
+    readScalar(transportProperties.lookup("dsdc"))
+);
+ 
+// Reference temperature and concentration for Marangoni / buoyancy
+dimensionedScalar Tr
+(
+    "Tr", dimTemperature,
+    readScalar(transportProperties.lookup("Tr"))
+);
+ 
+dimensionedScalar cr
+(
+    "cr", dimless,
+    readScalar(transportProperties.lookup("cr"))
+);
+
+// sigma as volScalarField — initially uniform at sigma0, updated in cEqn.H
+Info<< "Creating volScalarField sigma\n" << endl;
+volScalarField sigma
+(
+    IOobject
+    (
+        "sigma",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::AUTO_WRITE
+    ),
+    mesh,
+    sigma0
+);
+
+//-------------------------------------------
+// Boussinesq buoyancy parameters
+//   betaT1/2 : thermal expansion coefficients  [1/K]
+//   betaC1/2 : solutal expansion coefficients  [1/(unit c)]
+//   rho1/2Ref: reference densities for Boussinesq  [kg/m³]
+//-------------------------------------------
+Info<< "Reading buoyancy parameters\n" << endl;
+ 
+dimensionedScalar rho1Ref
+(
+    "rho1Ref", dimDensity,
+    readScalar(transportProperties.lookup("rho1Ref"))
+);
+dimensionedScalar rho2Ref
+(
+    "rho2Ref", dimDensity,
+    readScalar(transportProperties.lookup("rho2Ref"))
+);
+dimensionedScalar betaT1
+(
+    "betaT1", dimensionSet(0, 0, 0, -1, 0, 0, 0),
+    readScalar(transportProperties.lookup("betaT1"))
+);
+dimensionedScalar betaT2
+(
+    "betaT2", dimensionSet(0, 0, 0, -1, 0, 0, 0),
+    readScalar(transportProperties.lookup("betaT2"))
+);
+dimensionedScalar betaC1
+(
+    "betaC1", dimless,
+    readScalar(transportProperties.lookup("betaC1"))
+);
+dimensionedScalar betaC2
+(
+    "betaC2", dimless,
+    readScalar(transportProperties.lookup("betaC2"))
+);
+//-------------------------------------------
+// Enthalpy of absorption [J/kg]
+//-------------------------------------------
+dimensionedScalar Ha
+(
+    "Ha", dimensionSet(0, 2, -2, 0, 0, 0, 0),
+    readScalar(transportProperties.lookup("Ha"))
+);
+//-------------------------------------------
+// Interface normal fields (persistent — updated in UEqn.H each step)
+//   gradAlpha : volume-of-fluid gradient [1/m]
+//   nHat      : unit interface normal (gas→liquid)
+//   deltaN    : small stabilisation for nHat denominator [1/m]
+//-------------------------------------------
+Info<< "Creating interface-normal fields\n" << endl;
+ 
+const dimensionedScalar deltaN
+(
+    "deltaN",
+    dimless/dimLength,
+    scalar(1e-8) / std::pow(average(mesh.V()).value(), 1.0/3.0)
+);
+ 
+volVectorField gradAlpha
+(
+    IOobject
+    (
+        "gradAlpha",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    fvc::grad(alpha1)
+);
+ 
+volVectorField nHat
+(
+    IOobject
+    (
+        "nHat",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    gradAlpha / (mag(gradAlpha) + deltaN)
+);
+//-------------------------------------------
+// Diffusivity face field
+//-------------------------------------------
+surfaceScalarField Df
+(
+    IOobject
+    (
+        "Df",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    fvc::interpolate(alpha1) * D1 // + (scalar(1.0) - alphaf1) *D2
+);
+
+volScalarField m_abs
+(
+    IOobject
+    (
+        "m_abs",
+	runTime.timeName(),
+	mesh,
+	IOobject::NO_READ,
+        IOobject::AUTO_WRITE
+    ),
+    mesh,
+    dimensionedScalar("zero", dimMass/dimVolume/dimTime, 0.0) 
+);
+//-------------------------------------------
+
+// Need to store rho for ddt(rho, U)
+volScalarField rho
+(
+    IOobject
+    (
+        "rho",
+        runTime.timeName(),
+        mesh,
+        IOobject::READ_IF_PRESENT
+    ),
+    alpha1*rho1 + alpha2*rho2
+);
+rho.oldTime();
+
+//------------------- add thermal diffusivity kappa for moniter Fourier number--
+volScalarField kappa
+(
+    IOobject
+    (
+	"kappa",
+	runTime.timeName(),
+	mesh,
+	IOobject::READ_IF_PRESENT
+    ),
+    fvc::average(mixture.kappaf())
+
+);
+//------------------------------------------------------------------------------
+
+
+
+// Mass flux
+surfaceScalarField rhoPhi
+(
+    IOobject
+    (
+        "rhoPhi",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    fvc::interpolate(rho)*phi
+);
+
+//////////////modification: cal rhocp rhocpphi ///////////////////////////////////
+volScalarField rhoCp
+(
+    IOobject
+    (
+        "rhoCp",
+        runTime.timeName(),
+        mesh,
+        IOobject::READ_IF_PRESENT
+    ),
+    alpha1*rho1*cp1 + alpha2*rho2*cp2,
+    alpha1.boundaryField().types()
+);
+rhoCp.oldTime();        //what does it do? to calc first strp of ddt(rhoCp)?
+
+// heat flux — initial construction only (alphaPhi10 not yet declared).
+// Updated CONSISTENTLY every time step in cEqn.H / cl_cEqn.H using:
+//   rhoCpPhi = alphaPhi10*(rho1*cp1-rho2*cp2) + phi*(rho2*cp2)
+// to guarantee discrete conservation ddt(rhoCp)+div(rhoCpPhi)≈0.
+surfaceScalarField rhoCpPhi
+(
+    IOobject
+    (
+        "rhoCpPhi",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    fvc::interpolate(rhoCp)*phi
+);
+//////////////end/////////////////////////////////////////////////////////////////
+typedef incompressibleInterPhaseTransportModel
+    <
+        immiscibleIncompressibleTwoPhaseMixture
+    > transportModelType;
+
+autoPtr<transportModelType> turbulence
+(
+    new transportModelType
+    (
+        rho, U, phi, rhoPhi, mixture
+    )
+);
+
+#include "readGravitationalAcceleration.H"
+#include "readhRef.H"
+#include "gh.H"
+
+
+volScalarField p
+(
+    IOobject
+    (
+        "p",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::AUTO_WRITE
+    ),
+    p_rgh + rho*gh
+);
+
+label pRefCell = 0;
+scalar pRefValue = 0.0;
+setRefCell
+(
+    p,
+    p_rgh,
+    pimple.dict(),
+    pRefCell,
+    pRefValue
+);
+
+if (p_rgh.needReference())
+{
+    p += dimensionedScalar
+    (
+        "p",
+        p.dimensions(),
+        pRefValue - getRefCellValue(p, pRefCell)
+    );
+    p_rgh = p - rho*gh;
+}
+
+mesh.setFluxRequired(p_rgh.name());
+mesh.setFluxRequired(alpha1.name());
+
+// ============================================================
+// createFields.H additions
+//
+// Add these blocks to createFields.H so that the interface
+// geometry fields updated by updateInterfaceGeometry.H are
+// persistent (they live between timesteps and inner iterations).
+//
+// Place these near the existing gradAlpha / nHat declarations
+// (which stay as-is — those are still cell-centred and used
+// by UEqn for Marangoni).
+// ============================================================
+
+
+// ------------------------------------------------------------
+// Sfhat — face-normal unit vector.  MESH-DEPENDENT ONLY, not
+// alpha-dependent.  Build once and never update.
+// ------------------------------------------------------------
+surfaceVectorField Sfhat
+(
+    IOobject
+    (
+        "Sfhat",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    mesh.Sf() / mesh.magSf()
+);
+
+
+// ------------------------------------------------------------
+// gradAlphaf — face-native interface gradient
+// nHatf     — face-native unit interface normal
+// nDotSf    — nHatf . Sfhat  [-]
+// Updated by updateInterfaceGeometry.H once per timestep.
+// ------------------------------------------------------------
+surfaceVectorField gradAlphaf
+(
+    IOobject
+    (
+        "gradAlphaf",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    fvc::interpolate(gradAlpha)         // gradAlpha already exists above
+);
+
+surfaceVectorField nHatf
+(
+    IOobject
+    (
+        "nHatf",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    gradAlphaf
+  / ( mag(gradAlphaf)
+    + dimensionedScalar("small", dimless/dimLength, 1e-8)
+    )
+);
+
+surfaceScalarField nDotSf
+(
+    IOobject
+    (
+        "nDotSf",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    nHatf & Sfhat
+);
+
+
+// ------------------------------------------------------------
+// isInterfaceFace — 1 where owner-neighbour alphas straddle 0.5
+// D_masked        — alpha*D1 with interface faces zeroed
+// Updated by updateInterfaceGeometry.H once per timestep.
+// ------------------------------------------------------------
+surfaceScalarField isInterfaceFace
+(
+    IOobject
+    (
+        "isInterfaceFace",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    mesh,
+    dimensionedScalar("zero", dimless, 0.0)
+);
+
+surfaceScalarField D_masked
+(
+    IOobject
+    (
+        "D_masked",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    fvc::interpolate(alpha1) * D1        // initial value
+);
+
+
+// ------------------------------------------------------------
+// Q_abs — absorption heat source [W/m3]
+// Computed each PIMPLE iteration by computeQabs.H (before TEqn),
+// independently of m_abs (which is only produced later in cEqn.H).
+// Persistent so TEqn.H and diagnostics can read it.
+// ------------------------------------------------------------
+volScalarField Q_abs
+(
+    IOobject
+    (
+        "Q_abs",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::AUTO_WRITE
+    ),
+    mesh,
+    dimensionedScalar("zero", dimEnergy/dimVolume/dimTime, 0.0)
+);
+
+#include "createMRF.H"
+#include "createFvOptions.H"
+
+///////////// initialise Mabs accumulator & output file ////////////////////
+scalar Mabs_acc = 0.0;
+label  absWriteInterval = 10;
+
+fileName absDir(runTime.path()/"postProcessing"/"absed");
+mkDir(absDir);
+
+autoPtr<OFstream> absFilePtr
+(
+    new OFstream(absDir/"absorptionAccum.dat")
+);
+
+// Header — matches the 3 columns actually written by cEqn.H / cl_cEqn.H:
+//   runTime.value(), Mabs_acc, Mabs_acc/dz
+(*absFilePtr) << "# Time[s]  Mabs_acc[kg]  Mabs_acc_dz[kg/m]" << nl;
+absFilePtr->flush();
+
+--- END OF FILE: createFields.H ---
+
+--- START OF FILE: UEqn.H ---
+// ============================================================
+// Momentum equation with variable-σ Marangoni and buoyancy.
+//
+// Tangential Marangoni follows Castro tension.c surftension():
+//   F_st = [(I-n̂n̂)·∇σ] * |∇α| * 2*α₁
+// Normal capillary from mixture.sigmaK() scaled by sigma/sigma0.
+// Buoyancy: Boussinesq with betaT and betaC per phase.
+// ============================================================
+
+MRF.correctBoundaryVelocity(U);
+
+// cif and sigma updated here (formerly in cEqn.H).
+// cif uses freshest cSat (call 1 of updateCSat_T, T_prev).
+cif   = alpha1*c + (scalar(1) - alpha1)*cSat;
+cif.max(0.0);
+cif.min(1.0);            // guard against any c overshoo
+sigma = sigma0 + dsdT*(T - Tr) + dsdc*(cif - cr);
+sigma.max(dimensionedScalar("sigMin", sigma.dimensions(), 1e-4));
+
+// ------------------------------------------------------------
+// 2. Normal surface-tension / capillary force  [Pa/m on face]
+//
+//    sigmaK_var = sigma(T,cif) * K  scaled from mixture.sigmaK()
+//    Fsvn enters fvc::reconstruct() consistent with interFoam.
+// ------------------------------------------------------------
+volScalarField sigmaK_var
+(
+    IOobject("sigmaK_var", runTime.timeName(), mesh,
+             IOobject::NO_READ, IOobject::NO_WRITE),
+    mixture.sigmaK() * (sigma / sigma0)
+);
+
+surfaceScalarField Fsvn
+(
+    IOobject("Fsvn", runTime.timeName(), mesh,
+             IOobject::NO_READ, IOobject::NO_WRITE),
+    fvc::interpolate(sigmaK_var) * fvc::snGrad(alpha1)
+);
+
+// ------------------------------------------------------------
+// 3. Tangential Marangoni force  [N/m³]
+//
+//    F_st = [(I-n̂n̂)·∇σ] * |∇α| * 2 * pos(α₁-0.5)
+//
+//    |∇α| : CSF delta function [1/m] — interface area per unit
+//           volume. SYMMETRIC across the interface: a centred
+//           difference picks up the alpha jump equally on the
+//           liquid-side cell AND the gas-side cell straddling it.
+//
+//    pos(α₁-0.5) : binary liquid-side selector (1 if α₁>0.5, else 0).
+//           This is NOT the same mistake as the removed alpha1
+//           weighting. alpha1 is a CONTINUOUS attenuator that
+//           weakens the force at the interface cell itself
+//           (alpha~0.5 → factor 0.5). pos(alpha1-0.5) is a BINARY
+//           gate that does not touch the magnitude on the liquid
+//           side — it only zeroes the mirror contribution that
+//           |∇α| deposits on the gas-side cell of the same
+//           interface pair. Without this gate, *2 double-counts:
+//           both the liquid cell and its gas neighbour receive the
+//           full doubled force from the same interface jump.
+//
+//    factor 2: constant, from Castro's two-sided finite-difference
+//    stencil (E+W, N+S averaging) — combined with the liquid-side
+//    gate, deposits the full interfacial force once, on the liquid
+//    side only. Matches the same pattern used in cl_cEqn.H for
+//    absSource: 2*D1*(gradCif & gradAlpha) * pos(alpha1-0.5).
+//
+//    sigma is already built from cif = alpha1*c + (1-alpha1)*cSat
+//    in cEqn.H / cl_cEqn.H. In gas cells cif = cSat and T is anchored
+//    to Tr, so sigma naturally collapses to sigma0 there — no extra
+//    sigma_liq masking is needed. Use grad(sigma) directly.
+// ------------------------------------------------------------
+volVectorField gradSigma(fvc::grad(sigma));
+
+// Tangential projector: (I - n̂n̂)·∇σ  [N/m²]
+volVectorField gradSigma_tang
+(
+    IOobject("gradSigma_tang", runTime.timeName(), mesh,
+             IOobject::NO_READ, IOobject::NO_WRITE),
+    gradSigma - nHat*(nHat & gradSigma)
+);
+
+// Binary liquid-side gate: 1 where alpha1>0.5, 0 where alpha1<=0.5
+// Same gate used in cl_cEqn.H for absSource — keeps both equations
+// consistent in how they localise to the liquid side of the interface.
+volScalarField liquidGate
+(
+    IOobject("liquidGate", runTime.timeName(), mesh,
+             IOobject::NO_READ, IOobject::NO_WRITE),
+    pos(alpha1 - dimensionedScalar("half", dimless, 0.5))
+);
+
+// F_Marangoni = [(I-n̂n̂)·∇σ] * |∇α| * 2 * liquidGate   [N/m³] 
+// modifcation : no liquida gate needed here( aling to castro code) 
+volVectorField FMarangoni
+(
+    IOobject("FMarangoni", runTime.timeName(), mesh,
+             IOobject::NO_READ, IOobject::AUTO_WRITE),
+    gradSigma_tang * mag(gradAlpha) * scalar(2) * liquidGate
+);
+
+// Diagnostic decomposition into thermal (Fsvt) and solutal (Fsvc)
+// Same localisation: |∇α| * 2 * liquidGate
+// T_liq = alpha1*T + (1-alpha1)*Tr  — one-sided T gradient
+// cif already updated in cEqn.H/cl_cEqn.H before UEqn runs
+volScalarField T_liq
+(
+    IOobject("T_liq", runTime.timeName(), mesh,
+             IOobject::NO_READ, IOobject::NO_WRITE),
+    alpha1*T + (scalar(1) - alpha1)*Tr
+);
+
+volVectorField gradT(fvc::grad(T));
+
+// note grad(cif ) move the calcuetaion of c.blending here and since c.bledning ins not longer needed in cEqn.H 
+volVectorField gradCif_v(fvc::grad(cif));
+
+// remove liquid gate and replace with FF to alignt with the Castrso code 
+volVectorField Fsvt
+(
+    IOobject("Fsvt", runTime.timeName(), mesh,
+             IOobject::NO_READ, IOobject::AUTO_WRITE),
+    dsdT * (gradT - nHat*(nHat & gradT))
+         * mag(gradAlpha) * scalar(2) * liquidGate
+);
+
+volVectorField Fsvc
+(
+    IOobject("Fsvc", runTime.timeName(), mesh,
+             IOobject::NO_READ, IOobject::AUTO_WRITE),
+    dsdc * (gradCif_v - nHat*(nHat & gradCif_v))
+         * mag(gradAlpha) * scalar(2) * liquidGate
+);
+
+// ------------------------------------------------------------
+// 4. Buoyancy (Boussinesq)  [N/m³]
+//
+//    Fbuoy = -g * [α₁ρ₁ʳᵉᶠ(βT₁ΔT + βC₁Δc)
+//                +α₂ρ₂ʳᵉᶠ(βT₂ΔT + βC₂Δc)]
+//    ΔT = T - Tr,  Δc = c - cr
+//    betaC1 = -11.09 per unit mass fraction (×100 from Castro wt%)
+// ------------------------------------------------------------
+volVectorField Fbuoy
+(
+    IOobject("Fbuoy", runTime.timeName(), mesh,
+             IOobject::NO_READ, IOobject::AUTO_WRITE),
+    -g *
+    (
+        alpha1 * rho1Ref * (betaT1*(T - Tr) + betaC1*(c - cr))
+      + alpha2 * rho2Ref * (betaT2*(T - Tr) + betaC2*(c - cr))
+    )
+);
+ 
+// ------------------------------------------------------------
+// 5. Momentum equation
+// ------------------------------------------------------------
+fvVectorMatrix UEqn
+(
+    fvm::ddt(rho, U) + fvm::div(rhoPhi, U)
+  + MRF.DDt(rho, U)
+  + turbulence->divDevRhoReff(rho, U)
+ ==
+    fvOptions(rho, U)
+);
+
+UEqn.relax();
+fvOptions.constrain(UEqn);
+
+if (pimple.momentumPredictor())
+{
+    solve
+    (
+        UEqn
+     ==
+        fvc::reconstruct
+        (
+            (
+                Fsvn                      // normal capillary
+              - ghf*fvc::snGrad(rho)      // gravity head
+              - fvc::snGrad(p_rgh)        // modified pressure
+            ) * mesh.magSf()
+        )
+      + Fbuoy        // Boussinesq buoyancy
+      + FMarangoni   // tangential Marangoni: Castro 2*FF*|N|*(I-nn).grad(sigma)
+    );
+
+    fvOptions.correct(U);
+}
+
+if (runTime.writeTime())
+{
+    FMarangoni.write();
+    Fsvt.write();
+    Fsvc.write();
+    Fbuoy.write();
+}
+
+
+--- END OF FILE: UEqn.H ---
+
+--- START OF FILE: correctPhi.H ---
+CorrectPhi
+(
+    U,
+    phi,
+    p_rgh,
+    surfaceScalarField("rAUf", fvc::interpolate(rAU())),
+    geometricZeroField(),
+    pimple
+);
+
+#include "continuityErrs.H"
+
+--- END OF FILE: correctPhi.H ---
+
+--- START OF FILE: invadec.H ---
+// ============================================================
+// invadec.H
+// Update once every time step after alpha field solved.
+// Newly-flooded cells (alpha now > 0.5, was <= 0.5 last step): 
+// c = VOF-flux-weighted average of liquid neighbours (inflow only).
+// ============================================================
+const labelUList& own = mesh.owner();     // move to createField?
+const labelUList& nei = mesh.neighbour();
+
+const scalarField& alphaOld = alpha1.oldTime().primitiveField();
+forAll(c, celli)
+{
+	if (alpha1[celli] > 0.5 && alphaOld[celli] <= 0.5)
+	{
+	    scalar wSum = 0.0;
+	    scalar cSum = 0.0;
+	    const labelList& cellFaces = mesh.cells()[celli];
+	    forAll(cellFaces, fi)
+	    {
+		label facei = cellFaces[fi];
+		if (facei >= mesh.nInternalFaces()) continue;
+		label o   = own[facei];
+		label n   = nei[facei];
+		label nbr = (o == celli) ? n : o;
+		if (alpha1[nbr] <= 0.5) continue;
+		scalar influx = (o == celli)
+			      ? max(-alphaPhi10[facei], 0.0)
+			      : max( alphaPhi10[facei], 0.0);
+		if (influx > SMALL)
+		{
+		    wSum += influx;
+		    cSum += influx * c[nbr];
+		}
+	    }
+	    if (wSum > SMALL)
+		c[celli] = cSum / wSum;
+	}
+}
+c.correctBoundaryConditions();
+
+
+
+--- END OF FILE: invadec.H ---
+
+--- START OF FILE: updateCSat_T.H ---
+// updateCSat_T.H
+// ============================================================
+// Update cSat (equilibrium LiBr mass fraction) from local T and
+// the system pressure p_i.
+//
+// Uses the McNeely (1979) correlation via bisection — the same
+// implementation Castro uses in his solver:
+//   prop_X_T_P_LiBr_mac2 → bisection on prop_T_P_X_LiBr_mac2
+//
+// Reference:
+//   L. McNeely, "Thermodynamic properties of aqueous solutions of
+//   Lithium Bromide", ASHRAE Transactions Vol. 85 Pt.1, 1979.
+//
+// Compared to the earlier Daiguji linear form (valid only at
+// p_i = 2.315 kPa), the McNeely correlation:
+//   - is pressure-dependent (allows varying p_i)
+//   - is non-linear (accurate over wider T range)
+//   - matches Castro exactly (byte-consistent validation possible)
+//
+// In the operating range 303–318 K / x ∈ (0.40, 0.55), McNeely
+// and Daiguji agree to within ~1%. Outside that range Daiguji
+// diverges by up to 200%; McNeely stays valid down to 278 K.
+//
+// Direct correlation prop_T_P_X_LiBr_mac2 (T from P and x):
+//   pk   = p_Pa / 1000 / 6.895       [psia]  (Pa -> kPa -> psia)
+//   X    = x * 100                   [wt%]
+//   aux  = D² - 4·E·(C - log10(pk))
+//   trefk = -2·E / (D + sqrt(aux)) - 459.72   [°F, water ref temp]
+//   t_F  = B0 + B1·X + B2·X² + B3·X³
+//        + trefk·(A0 + A1·X + A2·X² + A3·X³)
+//   T_K  = (t_F - 32)·5/9 + 273.15
+//
+// Coefficients (Castro's exact values):
+//   A0 = -2.00755      A1 =  0.16976
+//   A2 = -3.133362e-3  A3 =  1.97668e-5
+//   B0 =  321.128      B1 = -19.322
+//   B2 =  0.374382     B3 = -2.0637e-3
+//   C  =  6.21147
+//   D  = -2886.373
+//   E  = -337269.46
+//
+// Inverse (X from P and T) via bisection over x ∈ [0.10, 0.70].
+//
+// Also computes T_sat_vap (pure-water saturation temperature at
+// system pressure) for use as T_gas_ref in TEqn.H.
+// For p_i = 2315 Pa: T_sat_vap ≈ 292.95 K (19.8°C) from steam tables.
+// Here we use a simple Antoine-form approximation valid near p_i.
+// ============================================================
+
+{
+    // System pressure (Pa) — read once from PIMPLE dict or use default
+    const scalar p_i = pimple.dict().lookupOrDefault<scalar>("p_i", 2315.0);
+
+    // McNeely coefficients
+    const scalar A0 = -2.00755;
+    const scalar A1 =  0.16976;
+    const scalar A2 = -3.133362e-3;
+    const scalar A3 =  1.97668e-5;
+    const scalar B0 =  321.128;
+    const scalar B1 = -19.322;
+    const scalar B2 =  0.374382;
+    const scalar B3 = -2.0637e-3;
+    const scalar C  =  6.21147;
+    const scalar D  = -2886.373;
+    const scalar E  = -337269.46;
+
+    // Pressure conversion Pa -> psia (once, outside the cell loop)
+    scalar pk = p_i / 1000.0 / 6.895;
+    if (pk <= 0.0) pk = 1.0;
+
+    // Reference water temp (°F): from Castro's aux computation
+    scalar aux = sqr(D) - 4.0*E*(C - ::log10(pk));
+    if (aux <= 0.0) aux = 0.0001;
+    const scalar trefk = -2.0*E/(D + ::sqrt(aux)) - 459.72;
+
+    // Bisection bounds and tolerance for X(T,P) inversion
+    const scalar x1_init = 0.10;
+    const scalar x2_init = 0.70;
+    const scalar tol     = 1e-5;
+    const label  maxIter = 500;
+
+    // Per-cell inversion
+    forAll(T, celli)
+    {
+        const scalar Ttarget = T[celli];
+
+        scalar x1 = x1_init;
+        scalar x2 = x2_init;
+        scalar xi = 0.5*(x1 + x2);
+        scalar tik = 0.0;
+
+        for (label iter = 0; iter < maxIter; ++iter)
+        {
+            xi = 0.5*(x1 + x2);
+            const scalar X = xi*100.0;   // wt%
+
+            // Direct correlation: t_F = B(X) + trefk*A(X)
+            const scalar tF =
+                B0 + B1*X + B2*X*X + B3*X*X*X
+              + trefk*(A0 + A1*X + A2*X*X + A3*X*X*X);
+
+            tik = (tF - 32.0)*5.0/9.0 + 273.15;
+
+            if (mag(tik - Ttarget) < tol) break;
+
+            if (tik > Ttarget) x2 = xi;
+            else               x1 = xi;
+        }
+
+        cSat[celli] = xi;
+    }
+
+    // Bound to McNeely's valid range
+    cSat.max(0.10);
+    cSat.min(0.70);
+    cSat.correctBoundaryConditions();
+
+    // Pure-water saturation temperature at p_i (for TEqn gas anchor)
+    // Antoine form valid over 0-100°C, coefficients for H2O in kPa/K:
+    //   log10(P_kPa) = A - B/(T_K + C_ant)
+    //   A = 7.19621, B = 1730.63, C_ant = -39.724 (Antoine, water, T in K, P in kPa)
+    {
+        const scalar A_ant =  7.19621;
+        const scalar B_ant =  1730.63;
+        const scalar C_ant = -39.724;
+        const scalar p_kPa =  p_i / 1000.0;
+
+        // Invert:  T = B/(A - log10(P)) - C
+        scalar Tsat_vap = 273.15;   // fallback
+        if (p_kPa > SMALL)
+        {
+            const scalar denom = A_ant - ::log10(p_kPa);
+            if (mag(denom) > SMALL)
+            {
+                Tsat_vap = B_ant/denom - C_ant;
+            }
+        }
+
+        Info<< "    p_i = " << p_i << " Pa,  T_sat_vap = "
+            << Tsat_vap << " K (pure-water saturation)" << endl;
+        Info<< "    min(cSat) = " << gMin(cSat)
+            << ", max(cSat) = " << gMax(cSat) << endl;
+    }
+}
+
+--- END OF FILE: updateCSat_T.H ---
+
+--- START OF FILE: computeQabs.H ---
+// ============================================================
+// computeQabs.H
+//
+// Compute the absorption heat source Q_abs directly from the
+// face-gradient of concentration.
+//
+// Runs BEFORE TEqn assembly. Consumes the CURRENT c field and
+// the CURRENT cSat field. Does NOT depend on m_abs (which is
+// only produced later, in cEqn.H). This decouples TEqn's Q_abs
+// from cEqn's m_abs
+//
+// absTCv (lines 583-596):
+//   Qx = habs * rho1/cSat * D * (dce*NXe + dcw*NXw)/2 * 2*FF
+//   Qy = habs * rho1/cSat * D * (dcn*NYn + dcs*NYs)/2 * 2*FF
+//   Q  = (Qx + Qy)                                    [W/m3]
+//
+// Discrete OpenFOAM analog per liquid cell:
+//   Q_abs[i] = Ha * rho1 * D / cSat[i]
+//            * SUM over interface faces touching cell i of
+//              (c_liq - cSat_gas) / delta * |nDotSf| * Sf / V
+//
+// Units:
+//   Ha            [J/kg]
+//   rho1          [kg/m3]
+//   D             [m2/s]
+//   dc            [1/m]
+//   |nDotSf|*Sf/V [1/m]     → face-summed [1/m2]
+//   1/cSat        [-]
+//   → Q_abs       [J/(m3 s)] = [W/m3]     ✓
+//
+// The FF factor (Castro's 2*FF) is implicit via nDotSf: for a
+// cell deep in liquid, nDotSf = 0 on all faces → Q_abs = 0
+// automatically. No explicit FF multiplication needed.
+// ============================================================
+
+// Reset Q_abs to zero, then accumulate over interface faces
+Q_abs = dimensionedScalar("zero", Q_abs.dimensions(), 0.0);
+
+{
+    const labelUList& ownQ = mesh.owner();
+    const labelUList& neiQ = mesh.neighbour();
+
+    scalarField& qRef = Q_abs.primitiveFieldRef();
+    const scalarField& c_    = c.primitiveField();
+    const scalarField& cSat_ = cSat.primitiveField();
+    const scalarField& V_    = mesh.V().field();
+    const scalarField& deltaCoeffs_ = mesh.deltaCoeffs().primitiveField();
+    const scalarField& magSf_       = mesh.magSf().primitiveField();
+
+    forAll(isInterfaceFace, facei)
+    {
+        if (isInterfaceFace[facei] > 0.5)
+        {
+            const label o = ownQ[facei];
+            const label n = neiQ[facei];
+            const scalar delta = 1.0 / deltaCoeffs_[facei];
+
+            label  liqCell;
+            scalar cSatGas;
+            if (alpha1[o] > alpha1[n])
+            {
+                liqCell = o;
+                cSatGas = cSat_[n];
+            }
+            else
+            {
+                liqCell = n;
+                cSatGas = cSat_[o];
+            }
+
+            const scalar dc = max(
+                (c_[liqCell] - cSatGas) / delta, scalar(0));
+            const scalar cSatLiq = max(cSat_[liqCell], scalar(1e-6));
+
+            // Absorption heat rate for this face into the liquid cell
+            //   = Ha * rho1/cSatLiq * D * dc * |nDotSf| * Sf / V
+            const scalar qFace = Ha.value() * rho1.value() / cSatLiq
+                               * D1.value() * dc
+                               * mag(nDotSf[facei])
+                               * magSf_[facei];
+
+            qRef[liqCell] += qFace / V_[liqCell];
+        }
+    }
+}
+
+Q_abs.correctBoundaryConditions();
+
+// Q_abs stats printed by TEqn.H after solve.  Bounded to >= 0
+// by the dc = max(..., 0) clamp above: each face contribution
+// is non-negative, so the accumulated Q_abs is absorption-only,
+// never desorption.
+
+--- END OF FILE: computeQabs.H ---
+
+--- START OF FILE: setDeltaT.H ---
+/*---------------------------------------------------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     |
+    \\  /    A nd           | www.openfoam.com
+     \\/     M anipulation  |
+-------------------------------------------------------------------------------
+    Copyright (C) 2011-2017 OpenFOAM Foundation
+-------------------------------------------------------------------------------
+License
+    This file is part of OpenFOAM.
+
+    OpenFOAM is free software: you can redistribute it and/or modify it
+    under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    OpenFOAM is distributed in the hope that it will be useful, but WITHOUT
+    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+    FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+    for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
+
+Global
+    setDeltaT
+
+Description
+    Reset the timestep to maintain a constant maximum courant Number.
+    Reduction of time-step is immediate, but increase is damped to avoid
+    unstable oscillations.
+
+\*---------------------------------------------------------------------------*/
+
+if (adjustTimeStep)
+{
+    scalar maxDeltaTFact =
+        min(maxCo/(CoNum + SMALL), maxAlphaCo/(alphaCoNum + SMALL));
+
+    scalar deltaTFact = min(min(maxDeltaTFact, 1.0 + 0.1*maxDeltaTFact), 1.2);
+
+    runTime.setDeltaT
+    (
+        min
+        (
+            deltaTFact*runTime.deltaTValue(),
+            maxDeltaT
+        )
+    );
+
+    Info<< "deltaT = " <<  runTime.deltaTValue() << endl;
+}
+
+// ************************************************************************* //
+
+--- END OF FILE: setDeltaT.H ---
+
+--- START OF FILE: initCorrectPhi.H ---
+tmp<volScalarField> rAU;
+
+if (correctPhi)
+{
+    rAU = new volScalarField
+    (
+        IOobject
+        (
+            "rAU",
+            runTime.timeName(),
+            mesh,
+            IOobject::READ_IF_PRESENT,
+            IOobject::AUTO_WRITE
+        ),
+        mesh,
+        dimensionedScalar("rAU", dimTime/dimDensity, 1)
+    );
+
+    #include "correctPhi.H"
+}
+else
+{
+    CorrectPhi
+    (
+        U,
+        phi,
+        p_rgh,
+        dimensionedScalar("rAUf", dimTime/rho.dimensions(), 1),
+        geometricZeroField(),
+        pimple
+    );
+
+    #include "continuityErrs.H"
+}
+
+--- END OF FILE: initCorrectPhi.H ---
+
+--- START OF FILE: alphaSuSp.H ---
+zeroField Su;
+zeroField Sp;
+zeroField divU;
+
+--- END OF FILE: alphaSuSp.H ---
+
+--- START OF FILE: invadec2.H ---
+// ============================================================
+// invadec2.H  —  Castro-aligned gas-cell BC for c
+//
+// For every cell with alpha < gasAlphaThresh:
+//   - if any neighbour is liquid (alpha >= gasAlphaThresh) →  c = cSat[cell]
+//     Absorption Dirichlet BC seen by the c equation.
+//   - otherwise (pure gas, no liquid nearby) →  c = 0
+//     Pure gas has no LiBr.  Prevents advection noise buildup
+//     since D_masked ≈ 0 gives no diffusive smoothing.
+//     Castro absorcion.c lines 344-364.
+//
+// gasAlphaThresh is read from system/fvSolution PIMPLE dict:
+//   PIMPLE
+//   {
+//       gasAlphaThresh 1e-2;   // default 0.5 if omitted
+//   }
+// A small value (1e-3 to 1e-2) matches Castro's MINF=0 more
+// closely — only truly gas cells get overwritten.  0.5 is a
+// broader "gas-dominated" definition.  For the stagnant pool
+// case a tight threshold is safer since cells with alpha in
+// (1e-3, 0.5) are physically part of the diffuse-interface
+// liquid and shouldn't be reset to cSat.
+//
+// Called TWICE per PIMPLE iteration in interAbsFoam.C — once
+// after each updateCSat_T.H.
+// ============================================================
+
+const scalar gasAlphaThresh
+(
+    pimple.dict().lookupOrDefault<scalar>("gasAlphaThresh", 0.01)
+);
+
+{
+    const labelList& own_ic = mesh.owner();
+    const labelList& nei_ic = mesh.neighbour();
+    const cellList&  cells  = mesh.cells();
+
+    scalarField& cRef = c.primitiveFieldRef();
+    const scalarField& cSatRef = cSat.primitiveField();
+
+    forAll(alpha1, celli)
+    {
+        if (alpha1[celli] < gasAlphaThresh)
+        {
+            // Gas cell — check whether any face neighbour is liquid
+            bool hasLiquidNbr = false;
+            const labelList& cFaces = cells[celli];
+
+            forAll(cFaces, i)
+            {
+                const label facei = cFaces[i];
+                if (mesh.isInternalFace(facei))
+                {
+                    const label nbr =
+                        (own_ic[facei] == celli)
+                      ?  nei_ic[facei]
+                      :  own_ic[facei];
+
+                    if (alpha1[nbr] >= gasAlphaThresh)
+                    {
+                        hasLiquidNbr = true;
+                        break;
+                    }
+                }
+            }
+
+            if (hasLiquidNbr)
+            {
+                // Interface gas cell — cSat Dirichlet BC
+                cRef[celli] = cSatRef[celli];
+            }
+            else
+            {
+                // Pure gas — no LiBr, kill advection noise
+                cRef[celli] = 0.0;
+            }
+        }
+    }
+}
+
+c.correctBoundaryConditions();
+
+--- END OF FILE: invadec2.H ---
+
+--- START OF FILE: alphaCourantNo.H ---
+/*---------------------------------------------------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     |
+    \\  /    A nd           | www.openfoam.com
+     \\/     M anipulation  |
+-------------------------------------------------------------------------------
+    Copyright (C) 2011-2017 OpenFOAM Foundation
+-------------------------------------------------------------------------------
+License
+    This file is part of OpenFOAM.
+
+    OpenFOAM is free software: you can redistribute it and/or modify it
+    under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    OpenFOAM is distributed in the hope that it will be useful, but WITHOUT
+    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+    FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+    for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with OpenFOAM.  If not, see <http://www.gnu.org/licenses/>.
+
+Global
+    alphaCourantNo
+
+Description
+    Calculates and outputs the mean and maximum Courant Numbers.
+
+\*---------------------------------------------------------------------------*/
+
+scalar maxAlphaCo
+(
+    runTime.controlDict().get<scalar>("maxAlphaCo")
+);
+
+scalar alphaCoNum = 0.0;
+scalar meanAlphaCoNum = 0.0;
+
+if (mesh.nInternalFaces())
+{
+    scalarField sumPhi
+    (
+        mixture.nearInterface()().primitiveField()
+       *fvc::surfaceSum(mag(phi))().primitiveField()
+    );
+
+    alphaCoNum = 0.5*gMax(sumPhi/mesh.V().field())*runTime.deltaTValue();
+
+    meanAlphaCoNum =
+        0.5*(gSum(sumPhi)/gSum(mesh.V().field()))*runTime.deltaTValue();
+}
+
+Info<< "Interface Courant Number mean: " << meanAlphaCoNum
+    << " max: " << alphaCoNum << endl;
+
+// ************************************************************************* //
+
+--- END OF FILE: alphaCourantNo.H ---
+
+--- START OF FILE: interAbsFoam.C ---
+/*---------------------------------------------------------------------------*\
+  interAbsFoam.C  —  main loop
+    - alpha, invadec, interface geometry: ONCE per timestep, outside PIMPLE
+    - inner PIMPLE loop = Castro SIMPLE loop:  U -> p -> T -> c
+    - two updateCSat_T calls per inner iteration: one before UEqn (T_prev),
+      one after TEqn (T_new) — matches Castro absTCv vs absTCv2 timing
+    - inner-loop residual check driven by outerCorrectorResidualControl
+      in fvSolution (see accompanying note)
+\*---------------------------------------------------------------------------*/
+
+#include "fvCFD.H"
+#include "dynamicFvMesh.H"
+#include "CMULES.H"
+#include "EulerDdtScheme.H"
+#include "localEulerDdtScheme.H"
+#include "CrankNicolsonDdtScheme.H"
+#include "subCycle.H"
+#include "myImmiscibleIncompressibleTwoPhaseMixture.H"
+#include "incompressibleInterPhaseTransportModel.H"
+#include "turbulentTransportModel.H"
+#include "pimpleControl.H"
+#include "fvOptions.H"
+#include "CorrectPhi.H"
+#include "fvcSmooth.H"
+
+
+int main(int argc, char *argv[])
+{
+    argList::addNote
+    (
+        "Two-phase LiBr/H2O absorption solver — Castro-aligned inner loop"
+    );
+
+    #include "postProcess.H"
+
+    #include "addCheckCaseOptions.H"
+    #include "setRootCaseLists.H"
+    #include "createTime.H"
+    #include "createDynamicFvMesh.H"
+    #include "initContinuityErrs.H"
+    #include "createDyMControls.H"
+    #include "createFields.H"
+    #include "createAlphaFluxes.H"
+    #include "initCorrectPhi.H"
+    #include "createUfIfPresent.H"
+
+    if (!LTS)
+    {
+        #include "CourantNo.H"
+        #include "setInitialDeltaT.H"
+    }
+
+    Info<< "\nStarting time loop\n" << endl;
+
+    while (runTime.run())
+    {
+        #include "readDyMControls.H"
+
+        if (LTS)
+        {
+            #include "setRDeltaT.H"
+        }
+        else
+        {
+            #include "CourantNo.H"
+            #include "alphaCourantNo.H"
+            #include "setDeltaT.H"
+        }
+
+        ++runTime;
+
+        Info<< "Time = " << runTime.timeName() << nl << endl;
+
+        // ==========================================================
+        // OUTER (per-timestep) block: alpha field, mesh, interface
+        // Runs exactly ONCE per timestep.
+        // Matches Castro's actualizaF() called after SIMPLE converges.
+        // ==========================================================
+
+        // --- Mesh update (dynamic mesh only) ---
+        if (moveMeshOuterCorrectors)
+        {
+            mesh.update();
+
+            if (mesh.changing())
+            {
+                if (mesh.topoChanging())
+                {
+                    talphaPhi1Corr0.clear();
+                }
+                gh  = (g & mesh.C())  - ghRef;
+                ghf = (g & mesh.Cf()) - ghRef;
+                MRF.update();
+
+                if (correctPhi)
+                {
+                    phi = mesh.Sf() & Uf();
+                    #include "correctPhi.H"
+                    fvc::makeRelative(phi, U);
+                    mixture.correct();
+                }
+
+                if (checkMeshCourantNo)
+                {
+                    #include "meshCourantNo.H"
+                }
+            }
+        }
+
+        // --- alpha equation (once per timestep) ---
+        #include "alphaControls.H"
+        #include "alphaEqnSubCycle.H"     // also updates rho, rhoCp
+        #include "invadec.H"              // c in newly-flooded cells
+        mixture.correct();
+
+        // --- interface geometry (once per timestep) ---
+        #include "updateInterfaceGeometry.H"
+
+
+        // ==========================================================
+        // INNER (Castro SIMPLE) loop: U -> p -> T -> c
+        //
+        // pimple.loop() honours nOuterCorrectors and
+        // outerCorrectorResidualControl set in system/fvSolution:
+        //
+        //   PIMPLE
+        //   {
+        //       nOuterCorrectors 9;         // Castro ITEMAX = 9
+        //       nCorrectors      2;
+        //       nNonOrthogonalCorrectors 1;
+        //       momentumPredictor yes;
+        //
+        //       outerCorrectorResidualControl
+        //       {
+        //           U     { tolerance 1e-5; relTol 0; }
+        //           p_rgh { tolerance 1e-5; relTol 0; }
+        //           T     { tolerance 1e-5; relTol 0; }
+        //           c     { tolerance 1e-5; relTol 0; }
+        //       }
+        //   }
+        //
+        // pimple.loop() exits when EITHER all controlled residuals
+        // are below tolerance OR nOuterCorrectors is reached.
+        // This gives Castro's exit condition (all residuals < 1e-5,
+        // max 9 iterations).
+        //
+        // Note: pimple.loop() has NO built-in minimum iteration
+        // count.  To enforce ITEMIN = 5, either accept early exit
+        // (usually harmless — residuals rarely reach 1e-5 in <5
+        // iterations for this coupled system) or convert to a
+        // manual for-loop with an if-check on iterCount.
+        // ==========================================================
+        while (pimple.loop())
+        {
+            if (pimple.frozenFlow())
+            {
+                continue;
+            }
+
+            // --- cSat call 1: at T_prev (used by invadec2, UEqn, TEqn) ---
+            #include "updateCSat_T.H"
+
+            // --- invadec2: hard-reset c = cSat in gas-side interface cells ---
+            #include "invadec2.H"
+
+            // --- momentum ---
+            #include "UEqn.H"        // includes Marangoni + Boussinesq
+
+            // --- pressure correction (with non-ortho subcorrectors) ---
+            while (pimple.correct())
+            {
+                #include "pEqn.H"
+            }
+
+            if (pimple.turbCorr())
+            {
+                turbulence->correct();
+            }
+
+            // --- absorption heat source (uses cSat from call 1, T_prev) ---
+            // Independent of m_abs — computed from c and cSat directly,
+            #include "computeQabs.H"
+
+            // --- energy ---
+            #include "TEqn.H"
+
+            // --- cSat call 2: at T_new (used by cEqn only) ---
+            #include "updateCSat_T.H"
+
+            #include "cEqn.H"
+                   }
+        // end of inner SIMPLE loop
+
+        runTime.write();
+        runTime.printExecutionTime(Info);
+    }
+
+    // --- concentration profile along vertical line at x = l/2 ---
+    forAll(mesh.cells(), celli)
+    {
+        vector cc = mesh.C()[celli];
+        if (mag(cc.x() - 0.038) < 0.001)
+        {
+            Info<< "y=" << cc.y()
+                << "  c=" << c[celli]
+                << "  T=" << T[celli] << nl;
+        }
+    }
+
+    Info<< "End\n" << endl;
+
+    return 0;
+}
+
+
+// ************************************************************************* //
+
+--- END OF FILE: interAbsFoam.C ---
+
+--- START OF FILE: alphaEqn.H ---
+{
+    word alphaScheme("div(phi,alpha)");
+    word alpharScheme("div(phirb,alpha)");
+
+    // Set the off-centering coefficient according to ddt scheme
+    scalar ocCoeff = 0;
+    {
+        tmp<fv::ddtScheme<scalar>> tddtAlpha
+        (
+            fv::ddtScheme<scalar>::New
+            (
+                mesh,
+                mesh.ddtScheme("ddt(alpha)")
+            )
+        );
+        const fv::ddtScheme<scalar>& ddtAlpha = tddtAlpha();
+
+        if
+        (
+            isType<fv::EulerDdtScheme<scalar>>(ddtAlpha)
+         || isType<fv::localEulerDdtScheme<scalar>>(ddtAlpha)
+        )
+        {
+            ocCoeff = 0;
+        }
+        else if (isType<fv::CrankNicolsonDdtScheme<scalar>>(ddtAlpha))
+        {
+            if (nAlphaSubCycles > 1)
+            {
+                FatalErrorInFunction
+                    << "Sub-cycling is not supported "
+                       "with the CrankNicolson ddt scheme"
+                    << exit(FatalError);
+            }
+
+            if
+            (
+                alphaRestart
+             || mesh.time().timeIndex() > mesh.time().startTimeIndex() + 1
+            )
+            {
+                ocCoeff =
+                    refCast<const fv::CrankNicolsonDdtScheme<scalar>>(ddtAlpha)
+                   .ocCoeff();
+            }
+        }
+        else
+        {
+            FatalErrorInFunction
+                << "Only Euler and CrankNicolson ddt schemes are supported"
+                << exit(FatalError);
+        }
+    }
+
+    // Set the time blending factor, 1 for Euler
+    scalar cnCoeff = 1.0/(1.0 + ocCoeff);
+
+    // Standard face-flux compression coefficient
+    surfaceScalarField phic(mixture.cAlpha()*mag(phi/mesh.magSf()));
+
+    // Add the optional isotropic compression contribution
+    if (icAlpha > 0)
+    {
+        phic *= (1.0 - icAlpha);
+        phic += (mixture.cAlpha()*icAlpha)*fvc::interpolate(mag(U));
+    }
+
+    // Add the optional shear compression contribution
+    if (scAlpha > 0)
+    {
+        phic +=
+            scAlpha*mag(mesh.delta() & fvc::interpolate(symm(fvc::grad(U))));
+    }
+
+
+    surfaceScalarField::Boundary& phicBf =
+        phic.boundaryFieldRef();
+
+    // Do not compress interface at non-coupled boundary faces
+    // (inlets, outlets etc.)
+    forAll(phic.boundaryField(), patchi)
+    {
+        fvsPatchScalarField& phicp = phicBf[patchi];
+
+        if (!phicp.coupled())
+        {
+            phicp == 0;
+        }
+    }
+
+    tmp<surfaceScalarField> phiCN(phi);
+
+    // Calculate the Crank-Nicolson off-centred volumetric flux
+    if (ocCoeff > 0)
+    {
+        phiCN = cnCoeff*phi + (1.0 - cnCoeff)*phi.oldTime();
+    }
+
+    if (MULESCorr)
+    {
+        #include "alphaSuSp.H"
+
+        fvScalarMatrix alpha1Eqn
+        (
+            (
+                LTS
+              ? fv::localEulerDdtScheme<scalar>(mesh).fvmDdt(alpha1)
+              : fv::EulerDdtScheme<scalar>(mesh).fvmDdt(alpha1)
+            )
+          + fv::gaussConvectionScheme<scalar>
+            (
+                mesh,
+                phiCN,
+                upwind<scalar>(mesh, phiCN)
+            ).fvmDiv(phiCN, alpha1)
+       // - fvm::Sp(fvc::ddt(dimensionedScalar("1", dimless, 1), mesh)
+       //           + fvc::div(phiCN), alpha1)
+         ==
+            Su + fvm::Sp(Sp + divU, alpha1)
+        );
+
+        alpha1Eqn.solve();
+
+        Info<< "Phase-1 volume fraction = "
+            << alpha1.weightedAverage(mesh.Vsc()).value()
+            << "  Min(" << alpha1.name() << ") = " << min(alpha1).value()
+            << "  Max(" << alpha1.name() << ") = " << max(alpha1).value()
+            << endl;
+
+        tmp<surfaceScalarField> talphaPhi1UD(alpha1Eqn.flux());
+        alphaPhi10 = talphaPhi1UD();
+
+        if (alphaApplyPrevCorr && talphaPhi1Corr0.valid())
+        {
+            Info<< "Applying the previous iteration compression flux" << endl;
+            MULES::correct
+            (
+                geometricOneField(),
+                alpha1,
+                alphaPhi10,
+                talphaPhi1Corr0.ref(),
+                oneField(),
+                zeroField()
+            );
+
+            alphaPhi10 += talphaPhi1Corr0();
+        }
+
+        // Cache the upwind-flux
+        talphaPhi1Corr0 = talphaPhi1UD;
+
+        alpha2 = 1.0 - alpha1;
+
+        mixture.correct();
+    }
+
+
+    for (int aCorr=0; aCorr<nAlphaCorr; aCorr++)
+    {
+        #include "alphaSuSp.H"
+
+        surfaceScalarField phir(phic*mixture.nHatf());
+
+        alphaPhiUn =
+            fvc::flux
+            (
+                phi,
+                alpha1,
+                alphaScheme
+            )
+          + fvc::flux
+            (
+               -fvc::flux(-phir, alpha2, alpharScheme),
+                alpha1,
+                alpharScheme
+            );
+
+        if (MULESCorr)
+        {
+            tmp<surfaceScalarField> talphaPhi1Corr(alphaPhiUn - alphaPhi10);
+            volScalarField alpha10("alpha10", alpha1);
+
+            MULES::correct
+            (
+                geometricOneField(),
+                alpha1,
+                alphaPhiUn,
+                talphaPhi1Corr.ref(),
+                Sp,
+                (-Sp*alpha1)(),
+                oneField(),
+                zeroField()
+            );
+
+            // Under-relax the correction for all but the 1st corrector
+            if (aCorr == 0)
+            {
+                alphaPhi10 += talphaPhi1Corr();
+            }
+            else
+            {
+                alpha1 = 0.5*alpha1 + 0.5*alpha10;
+                alphaPhi10 += 0.5*talphaPhi1Corr();
+            }
+        }
+        else
+        {
+            alphaPhi10 = alphaPhiUn;
+
+            MULES::explicitSolve
+            (
+                geometricOneField(),
+                alpha1,
+                phiCN,
+                alphaPhi10,
+                Sp,
+                (Su + divU*min(alpha1(), scalar(1)))(),
+                oneField(),
+                zeroField()
+            );
+        }
+
+        alpha2 = 1.0 - alpha1;
+
+        mixture.correct();
+    }
+
+    if (alphaApplyPrevCorr && MULESCorr)
+    {
+        talphaPhi1Corr0 = alphaPhi10 - talphaPhi1Corr0;
+        talphaPhi1Corr0.ref().rename("alphaPhi1Corr0");
+    }
+    else
+    {
+        talphaPhi1Corr0.clear();
+    }
+
+    #include "rhofs.H"
+
+    if
+    (
+        word(mesh.ddtScheme("ddt(rho,U)"))
+     == fv::EulerDdtScheme<vector>::typeName
+     || word(mesh.ddtScheme("ddt(rho,U)"))
+     == fv::localEulerDdtScheme<vector>::typeName
+    )
+    {
+        rhoPhi = alphaPhi10*(rho1f - rho2f) + phiCN*rho2f;
+	//update heat flux coeff
+	rhoCpPhi = alphaPhi10*(rho1f * cp1 - rho2f * cp2) + phiCN * rho2f * cp2;
+    }
+    else
+    {
+        if (ocCoeff > 0)
+        {
+            // Calculate the end-of-time-step alpha flux
+            alphaPhi10 =
+                (alphaPhi10 - (1.0 - cnCoeff)*alphaPhi10.oldTime())/cnCoeff;
+        }
+
+        // Calculate the end-of-time-step mass flux
+        rhoPhi = alphaPhi10*(rho1f - rho2f) + phi*rho2f;
+	// Add end-of-time heat flux
+	rhoCpPhi = alphaPhi10*(rho1f * cp1 - rho2 * cp2) + phi * rho2f * cp2;
+    }
+
+    Info<< "Phase-1 volume fraction = "
+        << alpha1.weightedAverage(mesh.Vsc()).value()
+        << "  Min(" << alpha1.name() << ") = " << min(alpha1).value()
+        << "  Max(" << alpha1.name() << ") = " << max(alpha1).value()
+        << endl;
+}
+
+--- END OF FILE: alphaEqn.H ---
+
+--- START OF FILE: writeAllFiles.py ---
+import os
+from pathlib import Path
+
+def combine_files_in_current_folder(output_filename="combined_output.txt"):
+    # Target the current working directory
+    current_dir = Path(".")
+    output_path = current_dir / output_filename
+
+    # Open the final output file for writing (using UTF-8 to prevent encoding issues)
+    with open(output_path, "w", encoding="utf-8") as outfile:
+        # Loop through all items in the directory
+        for item in current_dir.iterdir():
+            # Process only files, skip directories, and ignore the output file itself
+            if item.is_file() and item.name != output_filename:
+                try:
+                    # Write a visual header indicating which file's content follows
+                    outfile.write(f"\n--- START OF FILE: {item.name} ---\n")
+                    
+                    # Read the contents of the file and write to the combined file
+                    with open(item, "r", encoding="utf-8", errors="ignore") as infile:
+                        outfile.write(infile.read())
+                        
+                    outfile.write(f"\n--- END OF FILE: {item.name} ---\n")
+                    print(f"Successfully merged: {item.name}")
+                    
+                except Exception as e:
+                    print(f"Could not read {item.name} due to error: {e}")
+
+    print(f"\nFinished! All contents saved to: {output_path.resolve()}")
+
+if __name__ == "__main__":
+    combine_files_in_current_folder()
+
+
+--- END OF FILE: writeAllFiles.py ---
+
+--- START OF FILE: createAlphaFluxes.H ---
+IOobject alphaPhi10Header
+(
+    IOobject::groupName("alphaPhi0", alpha1.group()),
+    runTime.timeName(),
+    mesh,
+    IOobject::READ_IF_PRESENT,
+    IOobject::AUTO_WRITE
+);
+
+const bool alphaRestart =
+    alphaPhi10Header.typeHeaderOk<surfaceScalarField>(true);
+
+if (alphaRestart)
+{
+    Info << "Restarting alpha" << endl;
+}
+
+// MULES flux from previous time-step
+surfaceScalarField alphaPhi10
+(
+    alphaPhi10Header,
+    phi*fvc::interpolate(alpha1)
+);
+
+// MULES Correction
+tmp<surfaceScalarField> talphaPhi1Corr0;
+
+// MULES compressed flux is registered in case scalarTransport FO needs it.
+surfaceScalarField alphaPhiUn
+(
+    IOobject
+    (
+        "alphaPhiUn",
+        runTime.timeName(),
+        mesh,
+        IOobject::NO_READ,
+        IOobject::NO_WRITE
+    ),
+    mesh,
+    dimensionedScalar(phi.dimensions(), Zero)
+);
+
+--- END OF FILE: createAlphaFluxes.H ---
+
+--- START OF FILE: TEqn.H ---
+// ============================================================
+// TEqn.H  —  Castro-aligned temperature equation
+//
+//   rho*cp * dT/dt + rho*cp * div(U T) - div(kappa grad T) = Q_abs
+//
+// Q_abs is built by computeQabs.H BEFORE this file, using c and
+// cSat(T_prev) — matches Castro absTCv timing.
+// ============================================================
+
+T.correctBoundaryConditions();
+
+// ------------------------------------------------------------
+// Harmonic face conductivity (matches Castro mediarm)
+// ------------------------------------------------------------
+surfaceScalarField alpha1f(fvc::interpolate(alpha1));
+surfaceScalarField kappaf
+(
+    "kappaf",
+    scalar(1.0) /
+    (
+        alpha1f/kappa1 + (scalar(1.0) - alpha1f)/kappa2
+    )
+);
+
+// ------------------------------------------------------------
+// T bounds
+// ------------------------------------------------------------
+const scalar TMin(pimple.dict().lookupOrDefault<scalar>("TMin", 250.0));
+const scalar TMax(pimple.dict().lookupOrDefault<scalar>("TMax", 400.0));
+
+// ------------------------------------------------------------
+// Temperature equation
+// ------------------------------------------------------------
+fvScalarMatrix TEqn
+(
+    fvm::ddt(rhoCp, T)
+  + fvm::div(rhoCpPhi, T)
+  - fvm::laplacian(kappaf, T)
+ ==
+    Q_abs
+);
+
+TEqn.relax();
+TEqn.solve();
+
+forAll(T, cellI)
+{
+    T[cellI] = max(min(T[cellI], TMax), TMin);
+}
+
+fvOptions.correct(T);
+T.correctBoundaryConditions();
+
+// ------------------------------------------------------------
+// Diagnostic: m_abs_from_Q  [kg/s]
+//
+//   m_abs = Q_abs / Ha    (by definition Q_abs = Ha * m_abs)
+//
+// This is the mass rate implied by the heat source that was
+// just used in TEqn.  It should match m_abs_from_c (computed
+// in cEqn.H) at PIMPLE convergence — small mismatch in early
+// iterations is normal (TEqn used cSat(T_prev), cEqn will use
+// cSat(T_new)).  Consistency check: if these two diverge by
+// more than ~10% at PIMPLE convergence, look for a bug.
+// ------------------------------------------------------------
+const scalar mAbsFromQ =
+    fvc::domainIntegrate(Q_abs).value() / Ha.value();
+
+Info<< "T  min/max      [K]     = "
+    << gMin(T.primitiveField())
+    << " / " << gMax(T.primitiveField()) << endl;
+Info<< "Q_abs min/max   [W/m3]  = "
+    << gMin(Q_abs.primitiveField())
+    << " / " << gMax(Q_abs.primitiveField()) << endl;
+Info<< "m_abs_from_Q    [kg/s]  = " << mAbsFromQ << endl;
+
+// ------------------------------------------------------------
+// Interface temperature diagnostic — physical validation.
+//
+// Absorption releases heat at the interface (Q_abs > 0 there),
+// so T at the interface should rise above the initial value.
+// If T_interface stays flat while Q_abs is nonzero, either the
+// heat source is not being applied to interface cells, or the
+// diffusion is spreading the heat away too fast (bulk T rises
+// but interface doesn't stand out).
+//
+// Face T = 0.5 * (T[owner] + T[neighbour]) — since T is
+// continuous across the interface in this formulation, this is
+// well-defined and equals the interface T to leading order.
+// ------------------------------------------------------------
+{
+    scalar Tif_min =  GREAT;
+    scalar Tif_max = -GREAT;
+    scalar Tif_sum = 0.0;
+    label  Tif_cnt = 0;
+
+    const labelUList& own_t = mesh.owner();
+    const labelUList& nei_t = mesh.neighbour();
+
+    forAll(isInterfaceFace, facei)
+    {
+        if (isInterfaceFace[facei] > 0.5)
+        {
+            const scalar Tf = 0.5*(T[own_t[facei]] + T[nei_t[facei]]);
+            Tif_min = min(Tif_min, Tf);
+            Tif_max = max(Tif_max, Tf);
+            Tif_sum += Tf;
+            ++Tif_cnt;
+        }
+    }
+
+    reduce(Tif_min, minOp<scalar>());
+    reduce(Tif_max, maxOp<scalar>());
+    reduce(Tif_sum, sumOp<scalar>());
+    reduce(Tif_cnt, sumOp<label>());
+
+    const scalar Tif_mean =
+        (Tif_cnt > 0) ? (Tif_sum / Tif_cnt) : 0.0;
+
+    Info<< "T_interface min/mean/max [K] = "
+        << Tif_min << " / " << Tif_mean << " / "
+        << Tif_max
+        << "   (n = " << Tif_cnt << " faces)" << endl;
+}
+
+--- END OF FILE: TEqn.H ---

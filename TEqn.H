@@ -3,11 +3,18 @@
 //
 //   rho*cp * dT/dt + rho*cp * div(U T) - div(kappa grad T) = Q_abs
 //
-// Q_abs is built by computeQabs.H BEFORE this file, using c and
-// cSat(T_prev) — matches Castro absTCv timing.
+// Q_abs = Ha * m_abs, where m_abs was built by computeMabs.H
+// BEFORE this file, using cSat(T_prev) — matches Castro absTCv.
+//
+// Q_abs >= 0 always by construction (m_abs is bounded >= 0).
 // ============================================================
 
 T.correctBoundaryConditions();
+
+// ------------------------------------------------------------
+// Q_abs from m_abs — one-line consistency identity
+// ------------------------------------------------------------
+Q_abs = Ha * m_abs;
 
 // ------------------------------------------------------------
 // Harmonic face conductivity (matches Castro mediarm)
@@ -52,42 +59,20 @@ fvOptions.correct(T);
 T.correctBoundaryConditions();
 
 // ------------------------------------------------------------
-// Diagnostic: m_abs_from_Q  [kg/s]
-//
-//   m_abs = Q_abs / Ha    (by definition Q_abs = Ha * m_abs)
-//
-// This is the mass rate implied by the heat source that was
-// just used in TEqn.  It should match m_abs_from_c (computed
-// in cEqn.H) at PIMPLE convergence — small mismatch in early
-// iterations is normal (TEqn used cSat(T_prev), cEqn will use
-// cSat(T_new)).  Consistency check: if these two diverge by
-// more than ~10% at PIMPLE convergence, look for a bug.
+// Diagnostics
 // ------------------------------------------------------------
-const scalar mAbsFromQ =
+const scalar mAbsFromQ_TEqn =
     fvc::domainIntegrate(Q_abs).value() / Ha.value();
 
 Info<< "T  min/max      [K]     = "
-    << gMin(T.primitiveField())
-    << " / " << gMax(T.primitiveField()) << endl;
+    << gMin(T.primitiveField()) << " / "
+    << gMax(T.primitiveField()) << endl;
 Info<< "Q_abs min/max   [W/m3]  = "
-    << gMin(Q_abs.primitiveField())
-    << " / " << gMax(Q_abs.primitiveField()) << endl;
-Info<< "m_abs_from_Q    [kg/s]  = " << mAbsFromQ << endl;
+    << gMin(Q_abs.primitiveField()) << " / "
+    << gMax(Q_abs.primitiveField()) << endl;
+Info<< "m_abs (from Q)  [kg/s]  = " << mAbsFromQ_TEqn << endl;
 
-// ------------------------------------------------------------
-// Interface temperature diagnostic — physical validation.
-//
-// Absorption releases heat at the interface (Q_abs > 0 there),
-// so T at the interface should rise above the initial value.
-// If T_interface stays flat while Q_abs is nonzero, either the
-// heat source is not being applied to interface cells, or the
-// diffusion is spreading the heat away too fast (bulk T rises
-// but interface doesn't stand out).
-//
-// Face T = 0.5 * (T[owner] + T[neighbour]) — since T is
-// continuous across the interface in this formulation, this is
-// well-defined and equals the interface T to leading order.
-// ------------------------------------------------------------
+// Interface temperature diagnostic
 {
     scalar Tif_min =  GREAT;
     scalar Tif_max = -GREAT;
@@ -118,7 +103,6 @@ Info<< "m_abs_from_Q    [kg/s]  = " << mAbsFromQ << endl;
         (Tif_cnt > 0) ? (Tif_sum / Tif_cnt) : 0.0;
 
     Info<< "T_interface min/mean/max [K] = "
-        << Tif_min << " / " << Tif_mean << " / "
-        << Tif_max
+        << Tif_min << " / " << Tif_mean << " / " << Tif_max
         << "   (n = " << Tif_cnt << " faces)" << endl;
 }

@@ -36,14 +36,23 @@ nHatf      = gradAlphaf
 
 nDotSf = nHatf & Sfhat;
 
-// --- Interface face mask (owner-neighbour crosses 0.5) ---
+// --- Interface face mask (owner-neighbour straddle the threshold) ---
+// Threshold read from PIMPLE dict.  Default 0.5 = classical
+// "sign change of alpha - 0.5" detection.  Can be tuned to
+// e.g. 0.1 for a wider interface band that captures diffuse
+// interfaces without missing near-flat regions.
+const scalar ifaceThresh
+(
+    pimple.dict().lookupOrDefault<scalar>("ifaceAlphaThresh", 0.5)
+);
+
 forAll(isInterfaceFace, facei)
 {
     scalar aO = alpha1[own_[facei]];
     scalar aN = alpha1[nei_[facei]];
     isInterfaceFace[facei] =
-        (   (aO > 0.5 && aN < 0.5)
-         || (aO < 0.5 && aN > 0.5) )
+        (   (aO > ifaceThresh && aN < ifaceThresh)
+         || (aO < ifaceThresh && aN > ifaceThresh) )
         ? 1.0 : 0.0;
 }
 isInterfaceFace.correctBoundaryConditions();
