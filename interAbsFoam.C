@@ -235,6 +235,7 @@ int main(int argc, char *argv[])
         {
             Info<< "y=" << cc.y()
                 << "  c=" << c[celli]
+		<< "  cSat=" << cSat[celli] 
                 << "  T=" << T[celli] << nl;
         }
     }

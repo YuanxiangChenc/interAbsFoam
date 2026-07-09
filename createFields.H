@@ -624,6 +624,66 @@ volScalarField Q_abs
 );
 
 
+//------------------------------------------------------------
+// Persistent Marangoni and buoyancy force fields.
+//
+// These are declared here (not in UEqn.H) for two reasons:
+//   1. They must exist in timestep 0/ so paraFoam picks them up
+//      as available volume fields.  Locally-constructed IOobjects
+//      in UEqn.H are written to disk, but paraFoam builds its
+//      field list from timestep 0 and skips fields that aren't
+//      there.
+//   2. UEqn.H is called every PIMPLE inner iteration — declaring
+//      them there means constructor/destructor pair per iteration,
+//      which is wasteful and can leave stale references.
+//
+// UEqn.H assigns to these fields; runTime.write() handles the
+// AUTO_WRITE output automatically.
+// ------------------------------------------------------------
+volVectorField FMarangoni
+(
+    IOobject
+    (
+        "FMarangoni", runTime.timeName(), mesh,
+        IOobject::NO_READ, IOobject::AUTO_WRITE
+    ),
+    mesh,
+    dimensionedVector("zero", dimForce/dimVolume, vector::zero)
+);
+ 
+volVectorField Fsvt
+(
+    IOobject
+    (
+        "Fsvt", runTime.timeName(), mesh,
+        IOobject::NO_READ, IOobject::AUTO_WRITE
+    ),
+    mesh,
+    dimensionedVector("zero", dimForce/dimVolume, vector::zero)
+);
+ 
+volVectorField Fsvc
+(
+    IOobject
+    (
+        "Fsvc", runTime.timeName(), mesh,
+        IOobject::NO_READ, IOobject::AUTO_WRITE
+    ),
+    mesh,
+    dimensionedVector("zero", dimForce/dimVolume, vector::zero)
+);
+ 
+volVectorField Fbuoy
+(
+    IOobject
+    (
+        "Fbuoy", runTime.timeName(), mesh,
+        IOobject::NO_READ, IOobject::AUTO_WRITE
+    ),
+    mesh,
+    dimensionedVector("zero", dimForce/dimVolume, vector::zero)
+);
+
 // ------------------------------------------------------------
 // m_abs tracking scalars for inner-loop residual.
 //
